@@ -5,6 +5,29 @@
 This fork focuses on measuring and improving EtherCAT latency/jitter in SOEM.
 It adds performance instrumentation and test harnesses for cycle timing analysis.
 
+PERFORMANCE NOTES
+=================
+
+Clock mode (relative vs absolute)
+---------------------------------
+
+Some tests use `clock_nanosleep()` with `CLOCK_MONOTONIC`. You can choose
+relative sleep or absolute (TIMER_ABSTIME) scheduling by toggling the
+commented code paths in the test file.
+
+IRQ affinity (real-time responsiveness)
+---------------------------------------
+
+Disable irqbalance and pin the NIC IRQ to a dedicated CPU to reduce jitter.
+
+```
+sudo systemctl stop irqbalance
+sudo systemctl disable irqbalance
+
+# Example: eth0 IRQ 131 -> CPU 3 (bitmask 8)
+sudo sh -c 'echo 8 > /proc/irq/131/smp_affinity'
+```
+
 BUILDING
 ========
 
