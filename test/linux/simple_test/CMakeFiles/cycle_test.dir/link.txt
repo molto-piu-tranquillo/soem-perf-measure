@@ -1,0 +1,1 @@
+/usr/bin/cc  -Wall -Wextra -Werror -rdynamic CMakeFiles/cycle_test.dir/cycle_test.c.o -o cycle_test  ../../../libsoem.a -lpthread -lrt 

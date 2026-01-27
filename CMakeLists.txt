@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 2.8.4)
+cmake_minimum_required(VERSION 3.10)
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake/Modules")
 project(SOEM C)
 
@@ -10,6 +10,7 @@ endif()
 set(SOEM_INCLUDE_INSTALL_DIR include/soem)
 set(SOEM_LIB_INSTALL_DIR lib)
 set(BUILD_TESTS TRUE)
+set(SOEM_PATH "/home/test/EtherCAT/SOEM")
 
 if(WIN32)
   set(OS "win32")
@@ -64,6 +65,13 @@ include_directories(soem)
 include_directories(osal)
 include_directories(osal/${OS})
 include_directories(oshw/${OS})
+
+include_directories(
+  ${SOEM_PATH}/soem
+  ${SOEM_PATH}/osal
+  ${SOEM_PATH}/osal/linux
+  ${SOEM_PATH}/oshw/linux
+)
 
 add_library(soem STATIC
   ${SOEM_SOURCES}

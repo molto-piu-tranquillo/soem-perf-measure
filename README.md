@@ -2,6 +2,9 @@
 [![Build Status](https://travis-ci.org/OpenEtherCATsociety/SOEM.svg?branch=master)](https://travis-ci.org/OpenEtherCATsociety/SOEM)
 [![Build status](https://ci.appveyor.com/api/projects/status/bqgirjsxog9k1odf?svg=true)](https://ci.appveyor.com/project/hefloryd/soem-5kq8b)
 
+This fork focuses on measuring and improving EtherCAT latency/jitter in SOEM.
+It adds performance instrumentation and test harnesses for cycle timing analysis.
+
 BUILDING
 ========
 

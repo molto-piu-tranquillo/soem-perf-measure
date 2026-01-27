@@ -1,0 +1,1 @@
+/usr/bin/cc  -Wall -Wextra -Werror -rdynamic CMakeFiles/test.dir/test.c.o -o test  ../../../libsoem.a -lpthread -lrt 

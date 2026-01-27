@@ -1,0 +1,1 @@
+/usr/bin/cc  -Wall -Wextra -Werror -rdynamic CMakeFiles/latency_test.dir/latency_test.c.o -o latency_test  ../../../libsoem.a -lpthread -lrt 

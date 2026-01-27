@@ -44,8 +44,15 @@
 #include <netpacket/packet.h>
 #include <pthread.h>
 
+// #include <linux/if_packet.h> // PACKET_QDISC_BYPASS 사용을 위해 필수
+
 #include "oshw.h"
 #include "osal.h"
+#include "perf_measure.h"
+
+#ifndef PACKET_QDISC_BYPASS
+#define PACKET_QDISC_BYPASS 20
+#endif
 
 /** Redundancy modes */
 enum
@@ -56,16 +63,15 @@ enum
    ECT_RED_DOUBLE
 };
 
-
 /** Primary source MAC address used for EtherCAT.
  * This address is not the MAC address used from the NIC.
  * EtherCAT does not care about MAC addressing, but it is used here to
  * differentiate the route the packet traverses through the EtherCAT
  * segment. This is needed to find out the packet flow in redundant
  * configurations. */
-const uint16 priMAC[3] = { 0x0101, 0x0101, 0x0101 };
+const uint16 priMAC[3] = {0x0101, 0x0101, 0x0101};
 /** Secondary source MAC address used for EtherCAT. */
-const uint16 secMAC[3] = { 0x0404, 0x0404, 0x0404 };
+const uint16 secMAC[3] = {0x0404, 0x0404, 0x0404};
 
 /** second MAC word is used for identification */
 #define RX_PRIM priMAC[1]
@@ -75,7 +81,7 @@ const uint16 secMAC[3] = { 0x0404, 0x0404, 0x0404 };
 static void ecx_clear_rxbufstat(int *rxbufstat)
 {
    int i;
-   for(i = 0; i < EC_MAXBUF; i++)
+   for (i = 0; i < EC_MAXBUF; i++)
    {
       rxbufstat[i] = EC_BUF_EMPTY;
    }
@@ -106,14 +112,14 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
          /* when using secondary socket it is automatically a redundant setup */
          psock = &(port->redport->sockhandle);
          *psock = -1;
-         port->redstate                   = ECT_RED_DOUBLE;
-         port->redport->stack.sock        = &(port->redport->sockhandle);
-         port->redport->stack.txbuf       = &(port->txbuf);
+         port->redstate = ECT_RED_DOUBLE;
+         port->redport->stack.sock = &(port->redport->sockhandle);
+         port->redport->stack.txbuf = &(port->txbuf);
          port->redport->stack.txbuflength = &(port->txbuflength);
-         port->redport->stack.tempbuf     = &(port->redport->tempinbuf);
-         port->redport->stack.rxbuf       = &(port->redport->rxbuf);
-         port->redport->stack.rxbufstat   = &(port->redport->rxbufstat);
-         port->redport->stack.rxsa        = &(port->redport->rxsa);
+         port->redport->stack.tempbuf = &(port->redport->tempinbuf);
+         port->redport->stack.rxbuf = &(port->redport->rxbuf);
+         port->redport->stack.rxbufstat = &(port->redport->rxbufstat);
+         port->redport->stack.rxsa = &(port->redport->rxsa);
          ecx_clear_rxbufstat(&(port->redport->rxbufstat[0]));
       }
       else
@@ -125,27 +131,58 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
    else
    {
       pthread_mutexattr_init(&mutexattr);
-      pthread_mutexattr_setprotocol(&mutexattr  , PTHREAD_PRIO_INHERIT);
+      pthread_mutexattr_setprotocol(&mutexattr, PTHREAD_PRIO_INHERIT);
       pthread_mutex_init(&(port->getindex_mutex), &mutexattr);
-      pthread_mutex_init(&(port->tx_mutex)      , &mutexattr);
-      pthread_mutex_init(&(port->rx_mutex)      , &mutexattr);
-      port->sockhandle        = -1;
-      port->lastidx           = 0;
-      port->redstate          = ECT_RED_NONE;
-      port->stack.sock        = &(port->sockhandle);
-      port->stack.txbuf       = &(port->txbuf);
+      pthread_mutex_init(&(port->tx_mutex), &mutexattr);
+      pthread_mutex_init(&(port->rx_mutex), &mutexattr);
+      port->sockhandle = -1;
+      port->lastidx = 0;
+      port->redstate = ECT_RED_NONE;
+      port->stack.sock = &(port->sockhandle);
+      port->stack.txbuf = &(port->txbuf);
       port->stack.txbuflength = &(port->txbuflength);
-      port->stack.tempbuf     = &(port->tempinbuf);
-      port->stack.rxbuf       = &(port->rxbuf);
-      port->stack.rxbufstat   = &(port->rxbufstat);
-      port->stack.rxsa        = &(port->rxsa);
+      port->stack.tempbuf = &(port->tempinbuf);
+      port->stack.rxbuf = &(port->rxbuf);
+      port->stack.rxbufstat = &(port->rxbufstat);
+      port->stack.rxsa = &(port->rxsa);
       ecx_clear_rxbufstat(&(port->rxbufstat[0]));
       psock = &(port->sockhandle);
    }
    /* we use RAW packet socket, with packet type ETH_P_ECAT */
    *psock = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ECAT));
 
-   timeout.tv_sec =  0;
+   // =========================================================================
+   // [추가된 코드 시작] 리얼타임 성능 최적화 (QDisc Bypass & Busy Poll)
+   // =========================================================================
+
+   // 1. QDisc Bypass: 송신 시 트래픽 제어 계층을 무시하고 드라이버로 직행 (Lock 제거)
+   int qdisc_bypass = 1;
+   if (setsockopt(*psock, SOL_PACKET, PACKET_QDISC_BYPASS, &qdisc_bypass, sizeof(qdisc_bypass)) < 0)
+   {
+      // 에러 로그를 남기거나, 커널 버전이 낮아서 지원 안 할 경우 무시
+      // printf("Warning: PACKET_QDISC_BYPASS failed\n");
+   }
+
+   // 2. Busy Poll: 소켓 수신 시 Sleep 하지 않고 커널에서 대기 (지터 제거 핵심)
+   // 50us 정도는 CPU를 양보하지 않고 뱅뱅 돌며 기다림. (EtherCAT 주기에 맞춰 조정 가능)
+//   int busy_poll_us = 50;
+//   if (setsockopt(*psock, SOL_SOCKET, SO_BUSY_POLL, &busy_poll_us, sizeof(busy_poll_us)) < 0)
+//   {
+//      // printf("Warning: SO_BUSY_POLL failed\n");
+//   }
+
+   // 3. Socket Priority: 소켓 우선순위를 최고(7)로 설정
+   int prio = 6; // TC_PRIO_INTERACTIVE or equivalent
+   if (setsockopt(*psock, SOL_SOCKET, SO_PRIORITY, &prio, sizeof(prio)) < 0)
+   {
+      // printf("Warning: SO_PRIORITY failed\n");
+   }
+
+   // =========================================================================
+   // [추가된 코드 끝]
+   // =========================================================================
+
+   timeout.tv_sec = 0;
    timeout.tv_usec = 1;
    r = setsockopt(*psock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
    r = setsockopt(*psock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
@@ -174,7 +211,8 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
       port->rxbufstat[i] = EC_BUF_EMPTY;
    }
    ec_setupheader(&(port->txbuf2));
-   if (r == 0) rval = 1;
+   if (r == 0)
+      rval = 1;
 
    return rval;
 }
@@ -220,7 +258,7 @@ int ecx_getindex(ecx_portt *port)
    int idx;
    int cnt;
 
-   pthread_mutex_lock( &(port->getindex_mutex) );
+   pthread_mutex_lock(&(port->getindex_mutex));
 
    idx = port->lastidx + 1;
    /* index can't be larger than buffer array */
@@ -244,7 +282,7 @@ int ecx_getindex(ecx_portt *port)
       port->redport->rxbufstat[idx] = EC_BUF_ALLOC;
    port->lastidx = idx;
 
-   pthread_mutex_unlock( &(port->getindex_mutex) );
+   pthread_mutex_unlock(&(port->getindex_mutex));
 
    return idx;
 }
@@ -309,21 +347,21 @@ int ecx_outframe_red(ecx_portt *port, int idx)
    rval = ecx_outframe(port, idx, 0);
    if (port->redstate != ECT_RED_NONE)
    {
-      pthread_mutex_lock( &(port->tx_mutex) );
+      pthread_mutex_lock(&(port->tx_mutex));
       ehp = (ec_etherheadert *)&(port->txbuf2);
       /* use dummy frame for secondary socket transmit (BRD) */
-      datagramP = (ec_comt*)&(port->txbuf2[ETH_HEADERSIZE]);
+      datagramP = (ec_comt *)&(port->txbuf2[ETH_HEADERSIZE]);
       /* write index to frame */
       datagramP->index = idx;
       /* rewrite MAC source address 1 to secondary */
       ehp->sa1 = htons(secMAC[1]);
       /* transmit over secondary socket */
       port->redport->rxbufstat[idx] = EC_BUF_TX;
-      if (send(port->redport->sockhandle, &(port->txbuf2), port->txbuflength2 , 0) == -1)
+      if (send(port->redport->sockhandle, &(port->txbuf2), port->txbuflength2, 0) == -1)
       {
          port->redport->rxbufstat[idx] = EC_BUF_EMPTY;
       }
-      pthread_mutex_unlock( &(port->tx_mutex) );
+      pthread_mutex_unlock(&(port->tx_mutex));
    }
 
    return rval;
@@ -348,7 +386,9 @@ static int ecx_recvpkt(ecx_portt *port, int stacknumber)
       stack = &(port->redport->stack);
    }
    lp = sizeof(port->tempinbuf);
+
    bytesrx = recv(*stack->sock, (*stack->tempbuf), lp, 0);
+
    port->tempinbufs = bytesrx;
 
    return (bytesrx > 0);
@@ -372,13 +412,22 @@ static int ecx_recvpkt(ecx_portt *port, int stacknumber)
  */
 int ecx_inframe(ecx_portt *port, int idx, int stacknumber)
 {
-   uint16  l;
-   int     rval;
-   int     idxf;
+   uint16 l;
+   int rval;
+   int idxf;
    ec_etherheadert *ehp;
    ec_comt *ecp;
    ec_stackT *stack;
    ec_bufT *rxbuf;
+
+   static PerfMeasure my_timer;
+   static int timer_inited = 0;
+
+   if (!timer_inited)
+   {
+      pm_init(&my_timer, "My Test Timer");
+      timer_inited = 1;
+   }
 
    if (!stacknumber)
    {
@@ -401,16 +450,21 @@ int ecx_inframe(ecx_portt *port, int idx, int stacknumber)
    }
    else
    {
+//       pm_start(&my_timer); //시작
       pthread_mutex_lock(&(port->rx_mutex));
+//       pm_end(&my_timer);   //종료
+
       /* non blocking call to retrieve frame from socket */
+//      pm_start(&my_timer);    //시작
       if (ecx_recvpkt(port, stacknumber))
       {
+//         pm_end(&my_timer);   //종료
          rval = EC_OTHERFRAME;
-         ehp =(ec_etherheadert*)(stack->tempbuf);
+         ehp = (ec_etherheadert *)(stack->tempbuf);
          /* check if it is an EtherCAT frame */
          if (ehp->etype == htons(ETH_P_ECAT))
          {
-            ecp =(ec_comt*)(&(*stack->tempbuf)[ETH_HEADERSIZE]);
+            ecp = (ec_comt *)(&(*stack->tempbuf)[ETH_HEADERSIZE]);
             l = etohs(ecp->elength) & 0x0fff;
             idxf = ecp->index;
             /* found index equals requested index ? */
@@ -444,8 +498,7 @@ int ecx_inframe(ecx_portt *port, int idx, int stacknumber)
             }
          }
       }
-      pthread_mutex_unlock( &(port->rx_mutex) );
-
+      pthread_mutex_unlock(&(port->rx_mutex));
    }
 
    /* WKC if matching frame found */
@@ -467,9 +520,18 @@ int ecx_inframe(ecx_portt *port, int idx, int stacknumber)
 static int ecx_waitinframe_red(ecx_portt *port, int idx, osal_timert *timer)
 {
    osal_timert timer2;
-   int wkc  = EC_NOFRAME;
+   int wkc = EC_NOFRAME;
    int wkc2 = EC_NOFRAME;
    int primrx, secrx;
+
+//    static PerfMeasure my_timer;
+//    static int timer_inited = 0;
+//
+//    if (!timer_inited)
+//    {
+//       pm_init(&my_timer, "My Test Timer");
+//       timer_inited = 1;
+//    }
 
    /* if not in redundant mode then always assume secondary is OK */
    if (port->redstate == ECT_RED_NONE)
@@ -478,7 +540,11 @@ static int ecx_waitinframe_red(ecx_portt *port, int idx, osal_timert *timer)
    {
       /* only read frame if not already in */
       if (wkc <= EC_NOFRAME)
-         wkc  = ecx_inframe(port, idx, 0);
+      {
+//                  pm_start(&my_timer); //시작
+         wkc = ecx_inframe(port, idx, 0);
+//                  pm_end(&my_timer);   //종료
+      }
       /* only try secondary if in redundant mode */
       if (port->redstate != ECT_RED_NONE)
       {
@@ -486,21 +552,23 @@ static int ecx_waitinframe_red(ecx_portt *port, int idx, osal_timert *timer)
          if (wkc2 <= EC_NOFRAME)
             wkc2 = ecx_inframe(port, idx, 1);
       }
-   /* wait for both frames to arrive or timeout */
+      /* wait for both frames to arrive or timeout */
    } while (((wkc <= EC_NOFRAME) || (wkc2 <= EC_NOFRAME)) && !osal_timer_is_expired(timer));
    /* only do redundant functions when in redundant mode */
    if (port->redstate != ECT_RED_NONE)
    {
       /* primrx if the received MAC source on primary socket */
       primrx = 0;
-      if (wkc > EC_NOFRAME) primrx = port->rxsa[idx];
+      if (wkc > EC_NOFRAME)
+         primrx = port->rxsa[idx];
       /* secrx if the received MAC source on psecondary socket */
       secrx = 0;
-      if (wkc2 > EC_NOFRAME) secrx = port->redport->rxsa[idx];
+      if (wkc2 > EC_NOFRAME)
+         secrx = port->redport->rxsa[idx];
 
       /* primary socket got secondary frame and secondary socket got primary frame */
       /* normal situation in redundant mode */
-      if ( ((primrx == RX_SEC) && (secrx == RX_PRIM)) )
+      if (((primrx == RX_SEC) && (secrx == RX_PRIM)))
       {
          /* copy secondary buffer to primary */
          memcpy(&(port->rxbuf[idx]), &(port->redport->rxbuf[idx]), port->txbuflength[idx] - ETH_HEADERSIZE);
@@ -508,18 +576,18 @@ static int ecx_waitinframe_red(ecx_portt *port, int idx, osal_timert *timer)
       }
       /* primary socket got nothing or primary frame, and secondary socket got secondary frame */
       /* we need to resend TX packet */
-      if ( ((primrx == 0) && (secrx == RX_SEC)) ||
-           ((primrx == RX_PRIM) && (secrx == RX_SEC)) )
+      if (((primrx == 0) && (secrx == RX_SEC)) ||
+          ((primrx == RX_PRIM) && (secrx == RX_SEC)))
       {
          /* If both primary and secondary have partial connection retransmit the primary received
           * frame over the secondary socket. The result from the secondary received frame is a combined
           * frame that traversed all slaves in standard order. */
-         if ( (primrx == RX_PRIM) && (secrx == RX_SEC) )
+         if ((primrx == RX_PRIM) && (secrx == RX_SEC))
          {
             /* copy primary rx to tx buffer */
             memcpy(&(port->txbuf[idx][ETH_HEADERSIZE]), &(port->rxbuf[idx]), port->txbuflength[idx] - ETH_HEADERSIZE);
          }
-         osal_timer_start (&timer2, EC_TIMEOUTRET);
+         osal_timer_start(&timer2, EC_TIMEOUTRET);
          /* resend secondary tx */
          ecx_outframe(port, idx, 1);
          do
@@ -552,8 +620,22 @@ int ecx_waitinframe(ecx_portt *port, int idx, int timeout)
    int wkc;
    osal_timert timer;
 
-   osal_timer_start (&timer, timeout);
+   // static PerfMeasure my_timer;
+   // static int timer_inited = 0;
+
+   // if (!timer_inited)
+   // {
+   //    pm_init(&my_timer, "My Test Timer");
+   //    timer_inited = 1;
+   // }
+
+   // pm_start(&my_timer);
+   osal_timer_start(&timer, timeout);
+   // pm_end(&my_timer); // 종료
+
+   // pm_start(&my_timer); // 시작
    wkc = ecx_waitinframe_red(port, idx, &timer);
+   // pm_end(&my_timer); // 종료
 
    return wkc;
 }
@@ -575,24 +657,24 @@ int ecx_srconfirm(ecx_portt *port, int idx, int timeout)
    int wkc = EC_NOFRAME;
    osal_timert timer1, timer2;
 
-   osal_timer_start (&timer1, timeout);
+   osal_timer_start(&timer1, timeout);
    do
    {
       /* tx frame on primary and if in redundant mode a dummy on secondary */
       ecx_outframe_red(port, idx);
       if (timeout < EC_TIMEOUTRET)
       {
-         osal_timer_start (&timer2, timeout);
+         osal_timer_start(&timer2, timeout);
       }
       else
       {
          /* normally use partial timeout for rx */
-         osal_timer_start (&timer2, EC_TIMEOUTRET);
+         osal_timer_start(&timer2, EC_TIMEOUTRET);
       }
       /* get frame from primary or if in redundant mode possibly from secondary */
       wkc = ecx_waitinframe_red(port, idx, &timer2);
-   /* wait for answer with WKC>=0 or otherwise retry until timeout */
-   } while ((wkc <= EC_NOFRAME) && !osal_timer_is_expired (&timer1));
+      /* wait for answer with WKC>=0 or otherwise retry until timeout */
+   } while ((wkc <= EC_NOFRAME) && !osal_timer_is_expired(&timer1));
 
    return wkc;
 }

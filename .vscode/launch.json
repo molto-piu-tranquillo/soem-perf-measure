@@ -1,0 +1,33 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "SOEM 디버깅 (No Build)",
+            "type": "cppdbg",
+            "request": "launch",
+            // [중요] 빌드된 실행 파일이 있는 'build' 폴더를 가리켜야 함
+            "program": "$/home/test/EtherCAT/SOEM_DEBUG/build/test/linux/simple_test/cycle_test_2", 
+            "args": ["eth0"],
+            "stopAtEntry": true,
+            "logging": {
+                "engineLogging": true,
+                "trace": true,
+                "traceResponse": true
+            },
+            // "cwd": "${workspaceFolder}/build",
+            "cwd": "$/home/test/EtherCAT/SOEM_DEBUG/build/test/linux/simple_test/",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "${workspaceFolder}/gbd-sudo.sh",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ]
+            // [핵심] preLaunchTask 줄이 없어야 VS Code가 멍청한 빌드를 시도하지 않음!
+        }
+    ]
+}
