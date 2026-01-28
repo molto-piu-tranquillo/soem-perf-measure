@@ -11,7 +11,7 @@
 #define HIST_MAX 1000
 
 // 시간 측정용 구조체 (컨텍스트)
-typedef struct
+typedef struct PerfMeasure
 {
    char name[32];               // 측정 이름 (예: "Cycle Time")
    uint64_t hist[HIST_MAX + 2]; // 히스토그램 데이터

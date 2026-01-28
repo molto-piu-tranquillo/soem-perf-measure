@@ -25,13 +25,11 @@
 
 #include "ethercat.h"
 
-//#include "perf_measure.h"
+#include "perf_measure.h"
 
 
 #define EC_TIMEOUTMON 500
 
- #define HIST_MIN 1
- #define HIST_MAX 1000
 
 char IOmap[4096];
 OSAL_THREAD_HANDLE thread1;
@@ -210,21 +208,17 @@ void simpletest(char *ifname)
                 }
                 inOP = FALSE;
 
-                 puts("\n== Final Result ==");
-                 for (int cnt = 1; cnt <= HIST_MAX + 1; cnt++)
-                 {
-                     if (hist[cnt] != 0)
-                     {
-                         if (cnt == HIST_MAX + 1)
-                         {
-                             printf("001000+ %06ld\n", hist[cnt]);
-                         }
-                         else
-                         {
-                             printf("%06d %06ld\n", cnt, hist[cnt]);
-                         }
-                     }
-                 }
+                printf("\n=== recv() cycle %d ===\n", ecx_recv_timer.count);
+                for (int k = HIST_MIN; k <= HIST_MAX + 1; k++)
+                {
+                    if (ecx_recv_timer.hist[k] != 0)
+                    {
+                        if (k == HIST_MAX + 1)
+                            printf("%d+ %06ld\n", HIST_MAX, ecx_recv_timer.hist[k]);
+                        else
+                            printf("%06d %06ld\n", k, ecx_recv_timer.hist[k]);
+                    }
+                }
 
             }
             else

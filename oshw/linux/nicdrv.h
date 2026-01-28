@@ -18,6 +18,8 @@ extern "C"
 
 #include <pthread.h>
 
+typedef struct PerfMeasure PerfMeasure;
+
 /** pointer structure to Tx and Rx stacks */
 typedef struct
 {
@@ -88,6 +90,7 @@ typedef struct
 
 extern const uint16 priMAC[3];
 extern const uint16 secMAC[3];
+extern PerfMeasure ecx_recv_timer;
 
 #ifdef EC_VER1
 extern ecx_portt     ecx_port;

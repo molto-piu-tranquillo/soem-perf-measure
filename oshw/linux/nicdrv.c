@@ -78,6 +78,9 @@ const uint16 secMAC[3] = {0x0404, 0x0404, 0x0404};
 /** second MAC word is used for identification */
 #define RX_SEC secMAC[1]
 
+PerfMeasure ecx_recv_timer;
+static int ecx_recv_timer_inited = 0;
+
 static void ecx_clear_rxbufstat(int *rxbufstat)
 {
    int i;
@@ -387,7 +390,15 @@ static int ecx_recvpkt(ecx_portt *port, int stacknumber)
    }
    lp = sizeof(port->tempinbuf);
 
+   if (!ecx_recv_timer_inited)
+   {
+      pm_init(&ecx_recv_timer, "ecx_recvpkt recv");
+      ecx_recv_timer_inited = 1;
+   }
+
+   pm_start(&ecx_recv_timer);
    bytesrx = recv(*stack->sock, (*stack->tempbuf), lp, 0);
+   pm_end(&ecx_recv_timer);
 
    port->tempinbufs = bytesrx;
 
