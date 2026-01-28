@@ -387,7 +387,18 @@ static int ecx_recvpkt(ecx_portt *port, int stacknumber)
    }
    lp = sizeof(port->tempinbuf);
 
+   // static PerfMeasure my_timer;
+   // static int timer_inited = 0;
+
+   // if (!timer_inited)
+   // {
+   //    pm_init(&my_timer, "My Test Timer");
+   //    timer_inited = 1;
+   // }
+
+   // pm_start(&my_timer);
    bytesrx = recv(*stack->sock, (*stack->tempbuf), lp, 0);
+   // pm_end(&my_timer);
 
    port->tempinbufs = bytesrx;
 
