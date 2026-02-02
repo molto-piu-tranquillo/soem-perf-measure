@@ -28,6 +28,13 @@ sudo systemctl disable irqbalance
 sudo sh -c 'echo 8 > /proc/irq/131/smp_affinity'
 ```
 
+Trace marker collection
+-----------------------
+
+`test/linux/simple_test/cycle_test_2.c` writes outlier events to ftrace
+`trace_marker` as `OUTLIER ...` lines. Use `collect_trace_marker.sh` to
+collect those markers during a run.
+
 BUILDING
 ========
 
