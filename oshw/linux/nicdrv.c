@@ -163,12 +163,14 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
       // printf("Warning: PACKET_QDISC_BYPASS failed\n");
    }
 
-   // 2. Busy Poll: 소켓 수신 시 Sleep 하지 않고 커널에서 대기 (지터 제거 핵심)
-   // 50us 정도는 CPU를 양보하지 않고 뱅뱅 돌며 기다림. (EtherCAT 주기에 맞춰 조정 가능)
+   // 2. Busy Poll: AF_PACKET raw socket에서는 동작하지 않음 (검증 완료 2026-01-30)
+   // - sk_busy_loop()이 AF_PACKET에서 napi_busy_loop을 호출하지 않음
+   // - 설정 시 오히려 send-recv 전 구간 +5μs 악화 (mean 24.8→29.5, max 88→132μs)
+   // - TCP/UDP 소켓 전용 기능
 //   int busy_poll_us = 50;
 //   if (setsockopt(*psock, SOL_SOCKET, SO_BUSY_POLL, &busy_poll_us, sizeof(busy_poll_us)) < 0)
 //   {
-//      // printf("Warning: SO_BUSY_POLL failed\n");
+//       printf("Warning: SO_BUSY_POLL failed\n");
 //   }
 
    // 3. Socket Priority: 소켓 우선순위를 최고(7)로 설정

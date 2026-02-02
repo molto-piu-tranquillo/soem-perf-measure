@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <fcntl.h>
 
 // #include <net/if.h>
 
@@ -32,6 +33,8 @@
 
  #define HIST_MIN 1
  #define HIST_MAX 1000
+
+#define SNAPSHOT_THRESHOLD_US 40
 
 char IOmap[4096];
 OSAL_THREAD_HANDLE thread1;
@@ -113,10 +116,16 @@ void simpletest(char *ifname)
                 struct timespec target_ts;
                 clock_gettime(CLOCK_MONOTONIC, &target_ts); // 절대시간 계산 위한 기준점 설정
 
+                /* ftrace snapshot trigger fd (open once) */
+                int snap_fd = open("/sys/kernel/debug/tracing/snapshot", O_WRONLY);
+                if (snap_fd < 0)
+                    perror("snapshot open failed (tracing not set up?)");
+                int snap_count = 0;
+
                 /* cyclic loop */
                 int i = 0;
                 // for (i = 1; i <= 10000; i++)
-                while (i < 10000)
+                while (i < 9000)
                 {
                     i += 1;
 
@@ -165,6 +174,12 @@ void simpletest(char *ifname)
                      }
 /* ----------- 여기까지 --------------- */
 
+                     /* ftrace snapshot: 지연 발생 시 트리거 */
+                     if (period > SNAPSHOT_THRESHOLD_US && snap_fd >= 0) {
+                         write(snap_fd, "1", 1);
+                         snap_count++;
+                     }
+
                      /* 1초마다 누적 히스토그램 출력 */
 //                     if ((t1 - last_print_ns) >= 1000000000)
 //                     {
@@ -209,6 +224,10 @@ void simpletest(char *ifname)
 
                 }
                 inOP = FALSE;
+
+                 if (snap_fd >= 0)
+                     close(snap_fd);
+                 printf("\nSnapshot triggers: %d\n", snap_count);
 
                  puts("\n== Final Result ==");
                  for (int cnt = 1; cnt <= HIST_MAX + 1; cnt++)
