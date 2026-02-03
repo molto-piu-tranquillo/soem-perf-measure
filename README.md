@@ -22,15 +22,37 @@ Disable irqbalance and pin the NIC IRQ to a dedicated CPU to reduce jitter,
 especially when using PACKET_MMAP user-space busy polling (default in this
 branch). Keep NIC IRQ handling off the busy-polling CPU.
 
+Recommended procedure (example: reserve CPU2 for NIC IRQ/softirq):
+
+1. Disable irqbalance.
 ```
 sudo systemctl stop irqbalance
 sudo systemctl disable irqbalance
+```
 
+2. Pin the NIC IRQ(s) to CPU2.
+```
 # Find IRQ(s) for eth0
 grep -E "eth0|enp" /proc/interrupts
 
 # Example: IRQ 131 -> CPU2 (bitmask 0x4)
 sudo sh -c 'echo 4 > /proc/irq/131/smp_affinity'
+```
+
+3. Keep regular tasks off CPU2.
+Runtime (systemd slices):
+```
+sudo systemctl set-property --runtime -- system.slice AllowedCPUs=0,1,3-7
+sudo systemctl set-property --runtime -- user.slice AllowedCPUs=0,1,3-7
+sudo systemctl set-property --runtime -- init.scope AllowedCPUs=0,1,3-7
+```
+Optional: move currently running tasks off CPU2.
+```
+ps -eLo pid,psr,comm | awk '$2==2 {print $1}' | xargs -r -n1 taskset -pc 0,1,3-7
+```
+Boot-time (kernel cmdline):
+```
+isolcpus=2 nohz_full=2 rcu_nocbs=2
 ```
 
 Note: isolcpus/AllowedCPUs only keep regular tasks off a CPU. They do not move
