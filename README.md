@@ -15,29 +15,17 @@ Some tests use `clock_nanosleep()` with `CLOCK_MONOTONIC`. You can choose
 relative sleep or absolute (TIMER_ABSTIME) scheduling by toggling the
 commented code paths in the test file.
 
-IRQ affinity (real-time responsiveness)
----------------------------------------
+IRQ affinity and PACKET_MMAP polling
+------------------------------------
 
-Disable irqbalance and pin the NIC IRQ to a dedicated CPU to reduce jitter.
+Disable irqbalance and pin the NIC IRQ to a dedicated CPU to reduce jitter,
+especially when using PACKET_MMAP user-space busy polling (default in this
+branch). Keep NIC IRQ handling off the busy-polling CPU.
 
 ```
 sudo systemctl stop irqbalance
 sudo systemctl disable irqbalance
 
-# Example: eth0 IRQ 131 -> CPU2 (bitmask 0x4)
-sudo sh -c 'echo 4 > /proc/irq/131/smp_affinity'
-```
-
-PACKET_MMAP user-space polling
-------------------------------
-
-The Linux raw socket RX path can use PACKET_MMAP. In this branch, the default
-is user-space busy polling (no sleep when the RX ring is empty).
-
-You must keep NIC IRQ handling off the busy-polling CPU. The example below pins
-an eth0 IRQ to CPU2 (bitmask 0x4). Adjust the IRQ numbers and interface name.
-
-```
 # Find IRQ(s) for eth0
 grep -E "eth0|enp" /proc/interrupts
 
