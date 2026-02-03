@@ -65,7 +65,7 @@
 #define EC_PACKET_MMAP_PAGES_PER_BLOCK 8
 #endif
 #ifndef EC_PACKET_MMAP_POLL_NS
-#define EC_PACKET_MMAP_POLL_NS 1000
+#define EC_PACKET_MMAP_POLL_NS 0
 #endif
 
 /** Redundancy modes */
@@ -140,12 +140,46 @@ static void ecx_init_packet_mmap(ec_stackT *stack)
    stack->rx_frame_idx = 0;
 }
 
+static unsigned int ecx_packet_mmap_poll_ns(void)
+{
+   static int init = 0;
+   static unsigned int poll_ns = EC_PACKET_MMAP_POLL_NS;
+   const char *env;
+
+   if (init)
+   {
+      return poll_ns;
+   }
+   env = getenv("EC_PACKET_MMAP_POLL_NS");
+   if ((env != NULL) && (env[0] != '\0'))
+   {
+      char *end = NULL;
+      unsigned long v = strtoul(env, &end, 10);
+      if (end != env)
+      {
+         if (v > 1000000000UL)
+         {
+            v = 1000000000UL;
+         }
+         poll_ns = (unsigned int)v;
+      }
+   }
+   init = 1;
+   return poll_ns;
+}
+
 static void ecx_packet_mmap_wait(void)
 {
    struct timespec ts;
+   unsigned int poll_ns;
 
+   poll_ns = ecx_packet_mmap_poll_ns();
+   if (poll_ns == 0)
+   {
+      return;
+   }
    ts.tv_sec = 0;
-   ts.tv_nsec = EC_PACKET_MMAP_POLL_NS;
+   ts.tv_nsec = (long)poll_ns;
    (void)nanosleep(&ts, NULL);
 }
 

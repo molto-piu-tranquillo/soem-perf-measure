@@ -28,6 +28,30 @@ sudo systemctl disable irqbalance
 sudo sh -c 'echo 8 > /proc/irq/131/smp_affinity'
 ```
 
+PACKET_MMAP user-space polling
+------------------------------
+
+The Linux raw socket RX path can use PACKET_MMAP. In this branch, the default
+is user-space busy polling (no sleep when the RX ring is empty).
+
+You must keep NIC IRQ handling off the busy-polling CPU. The example below pins
+an eth0 IRQ to CPU2 (bitmask 0x4). Adjust the IRQ numbers and interface name.
+
+```
+# Find IRQ(s) for eth0
+grep -E "eth0|enp" /proc/interrupts
+
+# Example: IRQ 131 -> CPU2 (bitmask 0x4)
+sudo sh -c 'echo 4 > /proc/irq/131/smp_affinity'
+```
+
+To allow a small yield instead of full busy polling, set a non-zero sleep in
+nanoseconds (e.g. 1000 for ~1us):
+
+```
+export EC_PACKET_MMAP_POLL_NS=1000
+```
+
 Trace marker collection
 -----------------------
 
