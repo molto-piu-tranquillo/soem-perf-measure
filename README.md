@@ -25,44 +25,28 @@ branch). Keep NIC IRQ handling off the busy-polling CPU.
 Recommended procedure (example: reserve CPU2 for NIC IRQ/softirq and CPU3 for
 the SOEM real-time thread):
 
-1. Disable irqbalance.
-```
-sudo systemctl stop irqbalance
-sudo systemctl disable irqbalance
-```
-
-2. Pin the NIC IRQ(s) to CPU2.
-```
-# Find IRQ(s) for eth0
-grep -E "eth0|enp" /proc/interrupts
-
-# Example: IRQ 131 -> CPU2 (bitmask 0x4)
-sudo sh -c 'echo 4 > /proc/irq/131/smp_affinity'
-```
-
-3. Pin the SOEM real-time thread to CPU3 (example when launching the test).
-```
-sudo taskset -c 3 ./build/bin/cycle_test_2 eth0
-```
-
-4. Keep regular tasks off CPU2 and CPU3.
-Runtime (systemd slices):
-```
-sudo systemctl set-property --runtime -- system.slice AllowedCPUs=0,1,4-7
-sudo systemctl set-property --runtime -- user.slice AllowedCPUs=0,1,4-7
-sudo systemctl set-property --runtime -- init.scope AllowedCPUs=0,1,4-7
-```
-Optional: move currently running tasks off CPU2 and CPU3.
-```
-ps -eLo pid,psr,comm | awk '$2==2 || $2==3 {print $1}' | xargs -r -n1 taskset -pc 0,1,4-7
-```
-Boot-time (kernel cmdline):
+1. Boot-time (kernel cmdline):
 ```
 sudo sed -i.bak 's/isolcpus=domain,managed,3 nohz_full=3 rcu_nocbs=3/isolcpus=domain,managed_irq,2,3 nohz_full=2,3 rcu_nocbs=2,3/' /etc/default/grub
 sudo update-grub
 sudo reboot
 
 grep isolcpus /etc/default/grub
+```
+
+2. Disable irqbalance.
+```
+sudo systemctl stop irqbalance
+sudo systemctl disable irqbalance
+```
+
+3. Pin the NIC IRQ(s) to CPU2.
+```
+# Find IRQ(s) for eth0
+grep -E "eth0|enp" /proc/interrupts
+
+# Example: IRQ 131 -> CPU2 (bitmask 0x4)
+sudo sh -c 'echo 4 > /proc/irq/131/smp_affinity'
 ```
 
 
