@@ -22,7 +22,8 @@ Disable irqbalance and pin the NIC IRQ to a dedicated CPU to reduce jitter,
 especially when using PACKET_MMAP user-space busy polling (default in this
 branch). Keep NIC IRQ handling off the busy-polling CPU.
 
-Recommended procedure (example: reserve CPU2 for NIC IRQ/softirq):
+Recommended procedure (example: reserve CPU2 for NIC IRQ/softirq and CPU3 for
+the SOEM real-time thread):
 
 1. Disable irqbalance.
 ```
@@ -39,21 +40,29 @@ grep -E "eth0|enp" /proc/interrupts
 sudo sh -c 'echo 4 > /proc/irq/131/smp_affinity'
 ```
 
-3. Keep regular tasks off CPU2.
+3. Pin the SOEM real-time thread to CPU3 (example when launching the test).
+```
+sudo taskset -c 3 ./build/bin/cycle_test_2 eth0
+```
+
+4. Keep regular tasks off CPU2 and CPU3.
 Runtime (systemd slices):
 ```
-sudo systemctl set-property --runtime -- system.slice AllowedCPUs=0,1,3-7
-sudo systemctl set-property --runtime -- user.slice AllowedCPUs=0,1,3-7
-sudo systemctl set-property --runtime -- init.scope AllowedCPUs=0,1,3-7
+sudo systemctl set-property --runtime -- system.slice AllowedCPUs=0,1,4-7
+sudo systemctl set-property --runtime -- user.slice AllowedCPUs=0,1,4-7
+sudo systemctl set-property --runtime -- init.scope AllowedCPUs=0,1,4-7
 ```
-Optional: move currently running tasks off CPU2.
+Optional: move currently running tasks off CPU2 and CPU3.
 ```
-ps -eLo pid,psr,comm | awk '$2==2 {print $1}' | xargs -r -n1 taskset -pc 0,1,3-7
+ps -eLo pid,psr,comm | awk '$2==2 || $2==3 {print $1}' | xargs -r -n1 taskset -pc 0,1,4-7
 ```
 Boot-time (kernel cmdline):
 ```
-isolcpus=2 nohz_full=2 rcu_nocbs=2
+isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3
 ```
+
+Note: isolcpus/AllowedCPUs only keep regular tasks off a CPU. They do not move
+IRQs. You still must pin NIC IRQs explicitly.
 
 
 To allow a small yield instead of full busy polling, set a non-zero sleep in
