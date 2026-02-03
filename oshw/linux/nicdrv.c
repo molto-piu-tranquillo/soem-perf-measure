@@ -41,10 +41,11 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <string.h>
-#include <netpacket/packet.h>
+#include <strings.h>
+#include <linux/if_packet.h>
 #include <pthread.h>
-
-// #include <linux/if_packet.h> // PACKET_QDISC_BYPASS 사용을 위해 필수
+#include <sys/mman.h>
+#include <stdlib.h>
 
 #include "oshw.h"
 #include "osal.h"
@@ -52,6 +53,19 @@
 
 #ifndef PACKET_QDISC_BYPASS
 #define PACKET_QDISC_BYPASS 20
+#endif
+
+#ifndef EC_PACKET_MMAP_ENV
+#define EC_PACKET_MMAP_ENV "EC_PACKET_MMAP"
+#endif
+#ifndef EC_PACKET_MMAP_BLOCKS
+#define EC_PACKET_MMAP_BLOCKS 8
+#endif
+#ifndef EC_PACKET_MMAP_PAGES_PER_BLOCK
+#define EC_PACKET_MMAP_PAGES_PER_BLOCK 8
+#endif
+#ifndef EC_PACKET_MMAP_POLL_NS
+#define EC_PACKET_MMAP_POLL_NS 1000
 #endif
 
 /** Redundancy modes */
@@ -87,6 +101,205 @@ static void ecx_clear_rxbufstat(int *rxbufstat)
    }
 }
 
+static unsigned int ecx_gcd_u32(unsigned int a, unsigned int b)
+{
+   while (b != 0)
+   {
+      unsigned int t = a % b;
+      a = b;
+      b = t;
+   }
+   return a;
+}
+
+static unsigned int ecx_lcm_u32(unsigned int a, unsigned int b)
+{
+   unsigned int g;
+   unsigned long long lcm;
+
+   if ((a == 0) || (b == 0))
+   {
+      return 0;
+   }
+   g = ecx_gcd_u32(a, b);
+   lcm = (unsigned long long)(a / g) * (unsigned long long)b;
+   if (lcm > 0xFFFFFFFFULL)
+   {
+      return 0;
+   }
+   return (unsigned int)lcm;
+}
+
+static void ecx_init_packet_mmap(ec_stackT *stack)
+{
+   stack->use_packet_mmap = 0;
+   stack->rx_ring = NULL;
+   stack->rx_ring_size = 0;
+   stack->rx_frame_size = 0;
+   stack->rx_frame_nr = 0;
+   stack->rx_frame_idx = 0;
+}
+
+static void ecx_packet_mmap_wait(void)
+{
+   struct timespec ts;
+
+   ts.tv_sec = 0;
+   ts.tv_nsec = EC_PACKET_MMAP_POLL_NS;
+   (void)nanosleep(&ts, NULL);
+}
+
+static int ecx_packet_mmap_enabled(void)
+{
+   const char *env = getenv(EC_PACKET_MMAP_ENV);
+   if ((env == NULL) || (env[0] == '\0'))
+   {
+      return 1; /* default on */
+   }
+   if ((strcmp(env, "0") == 0) ||
+       (strcasecmp(env, "false") == 0) ||
+       (strcasecmp(env, "off") == 0) ||
+       (strcasecmp(env, "no") == 0))
+   {
+      return 0;
+   }
+   return 1;
+}
+
+static int ecx_setup_packet_mmap(ec_stackT *stack, int sock)
+{
+   struct tpacket_req req;
+   unsigned int frame_size;
+   unsigned int page_size;
+   unsigned int block_size;
+   unsigned int frames_per_block;
+   unsigned int block_nr;
+   unsigned int frame_nr;
+   unsigned long long block_size_ll;
+   unsigned long long min_block_size_ll;
+   size_t ring_size;
+   void *ring;
+   int version;
+
+   if (!ecx_packet_mmap_enabled())
+   {
+      return 0;
+   }
+
+   version = TPACKET_V1;
+   if (setsockopt(sock, SOL_PACKET, PACKET_VERSION, &version, sizeof(version)) < 0)
+   {
+      return 0;
+   }
+
+   frame_size = TPACKET_ALIGN(TPACKET_HDRLEN + EC_MAXECATFRAME);
+   page_size = (unsigned int)getpagesize();
+   block_size = ecx_lcm_u32(page_size, frame_size);
+   if (block_size == 0)
+   {
+      return 0;
+   }
+   min_block_size_ll = (unsigned long long)page_size * (unsigned long long)EC_PACKET_MMAP_PAGES_PER_BLOCK;
+   block_size_ll = (unsigned long long)block_size;
+   while (block_size_ll < min_block_size_ll)
+   {
+      block_size_ll += (unsigned long long)block_size;
+      if (block_size_ll > 0xFFFFFFFFULL)
+      {
+         return 0;
+      }
+   }
+   block_size = (unsigned int)block_size_ll;
+   frames_per_block = block_size / frame_size;
+   if (frames_per_block == 0)
+   {
+      return 0;
+   }
+   block_nr = EC_PACKET_MMAP_BLOCKS;
+   frame_nr = frames_per_block * block_nr;
+
+   memset(&req, 0, sizeof(req));
+   req.tp_block_size = block_size;
+   req.tp_block_nr = block_nr;
+   req.tp_frame_size = frame_size;
+   req.tp_frame_nr = frame_nr;
+
+   if (setsockopt(sock, SOL_PACKET, PACKET_RX_RING, &req, sizeof(req)) < 0)
+   {
+      return 0;
+   }
+
+   ring_size = (size_t)req.tp_block_size * req.tp_block_nr;
+   ring = mmap(NULL, ring_size, PROT_READ | PROT_WRITE, MAP_SHARED, sock, 0);
+   if (ring == MAP_FAILED)
+   {
+      struct tpacket_req req_empty;
+      memset(&req_empty, 0, sizeof(req_empty));
+      setsockopt(sock, SOL_PACKET, PACKET_RX_RING, &req_empty, sizeof(req_empty));
+      return 0;
+   }
+
+   stack->use_packet_mmap = 1;
+   stack->rx_ring = ring;
+   stack->rx_ring_size = ring_size;
+   stack->rx_frame_size = req.tp_frame_size;
+   stack->rx_frame_nr = req.tp_frame_nr;
+   stack->rx_frame_idx = 0;
+
+   return 1;
+}
+
+static void ecx_teardown_packet_mmap(ec_stackT *stack, int sock)
+{
+   struct tpacket_req req;
+
+   if (!stack->use_packet_mmap || (stack->rx_ring == NULL))
+   {
+      return;
+   }
+   memset(&req, 0, sizeof(req));
+   setsockopt(sock, SOL_PACKET, PACKET_RX_RING, &req, sizeof(req));
+   munmap(stack->rx_ring, stack->rx_ring_size);
+   ecx_init_packet_mmap(stack);
+}
+
+static int ecx_recvpkt_mmap(ecx_portt *port, ec_stackT *stack)
+{
+   struct tpacket_hdr *hdr;
+   uint8 *pkt;
+   unsigned int snaplen;
+
+   hdr = (struct tpacket_hdr *)((uint8 *)stack->rx_ring + (stack->rx_frame_idx * stack->rx_frame_size));
+   if ((hdr->tp_status & TP_STATUS_USER) == 0)
+   {
+      ecx_packet_mmap_wait();
+      if ((hdr->tp_status & TP_STATUS_USER) == 0)
+      {
+         return 0;
+      }
+   }
+   __sync_synchronize();
+
+   pkt = (uint8 *)hdr + hdr->tp_mac;
+   snaplen = hdr->tp_snaplen;
+   if (snaplen > sizeof(ec_bufT))
+   {
+      snaplen = sizeof(ec_bufT);
+   }
+   memcpy(*stack->tempbuf, pkt, snaplen);
+   port->tempinbufs = (int)snaplen;
+
+   __sync_synchronize();
+   hdr->tp_status = TP_STATUS_KERNEL;
+   stack->rx_frame_idx++;
+   if (stack->rx_frame_idx >= stack->rx_frame_nr)
+   {
+      stack->rx_frame_idx = 0;
+   }
+
+   return 1;
+}
+
 /** Basic setup to connect NIC to socket.
  * @param[in] port        = port context struct
  * @param[in] ifname      = Name of NIC device, f.e. "eth0"
@@ -101,6 +314,7 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
    struct ifreq ifr;
    struct sockaddr_ll sll;
    int *psock;
+   ec_stackT *stack;
    pthread_mutexattr_t mutexattr;
 
    rval = 0;
@@ -121,6 +335,7 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
          port->redport->stack.rxbufstat = &(port->redport->rxbufstat);
          port->redport->stack.rxsa = &(port->redport->rxsa);
          ecx_clear_rxbufstat(&(port->redport->rxbufstat[0]));
+         stack = &(port->redport->stack);
       }
       else
       {
@@ -146,8 +361,10 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
       port->stack.rxbufstat = &(port->rxbufstat);
       port->stack.rxsa = &(port->rxsa);
       ecx_clear_rxbufstat(&(port->rxbufstat[0]));
+      stack = &(port->stack);
       psock = &(port->sockhandle);
    }
+   ecx_init_packet_mmap(stack);
    /* we use RAW packet socket, with packet type ETH_P_ECAT */
    *psock = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ECAT));
 
@@ -183,6 +400,11 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
    // =========================================================================
    // [추가된 코드 끝]
    // =========================================================================
+
+   if (*psock >= 0)
+   {
+      (void)ecx_setup_packet_mmap(stack, *psock);
+   }
 
    timeout.tv_sec = 0;
    timeout.tv_usec = 1;
@@ -226,9 +448,15 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
 int ecx_closenic(ecx_portt *port)
 {
    if (port->sockhandle >= 0)
+   {
+      ecx_teardown_packet_mmap(&(port->stack), port->sockhandle);
       close(port->sockhandle);
+   }
    if ((port->redport) && (port->redport->sockhandle >= 0))
+   {
+      ecx_teardown_packet_mmap(&(port->redport->stack), port->redport->sockhandle);
       close(port->redport->sockhandle);
+   }
 
    return 0;
 }
@@ -386,6 +614,10 @@ static int ecx_recvpkt(ecx_portt *port, int stacknumber)
    else
    {
       stack = &(port->redport->stack);
+   }
+   if (stack->use_packet_mmap)
+   {
+      return ecx_recvpkt_mmap(port, stack);
    }
    lp = sizeof(port->tempinbuf);
 

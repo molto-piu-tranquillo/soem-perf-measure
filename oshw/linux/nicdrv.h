@@ -17,6 +17,7 @@ extern "C"
 #endif
 
 #include <pthread.h>
+#include <stddef.h>
 
 /** pointer structure to Tx and Rx stacks */
 typedef struct
@@ -35,6 +36,18 @@ typedef struct
    int         (*rxbufstat)[EC_MAXBUF];
    /** received MAC source address (middle word) */
    int         (*rxsa)[EC_MAXBUF];
+   /** PACKET_MMAP enable flag */
+   int         use_packet_mmap;
+   /** PACKET_MMAP RX ring base */
+   void        *rx_ring;
+   /** PACKET_MMAP RX ring size in bytes */
+   size_t      rx_ring_size;
+   /** PACKET_MMAP frame size */
+   unsigned int rx_frame_size;
+   /** PACKET_MMAP frame count */
+   unsigned int rx_frame_nr;
+   /** PACKET_MMAP current frame index */
+   unsigned int rx_frame_idx;
 } ec_stackT;
 
 /** pointer structure to buffers for redundant port */
