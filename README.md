@@ -61,9 +61,6 @@ Boot-time (kernel cmdline):
 isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3
 ```
 
-Note: isolcpus/AllowedCPUs only keep regular tasks off a CPU. They do not move
-IRQs. You still must pin NIC IRQs explicitly.
-
 
 To allow a small yield instead of full busy polling, set a non-zero sleep in
 nanoseconds (e.g. 1000 for ~1us):

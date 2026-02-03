@@ -117,15 +117,14 @@ void simpletest(char *ifname)
                 clock_gettime(CLOCK_MONOTONIC, &target_ts); // 절대시간 계산 위한 기준점 설정
 
                 /* ftrace trace_marker fd (open once) */
-                int marker_fd = open("/sys/kernel/debug/tracing/trace_marker", O_WRONLY);
-                if (marker_fd < 0)
-                    perror("trace_marker open failed (tracing not set up?)");
-                int outlier_count = 0;
+//                int marker_fd = -1;
+//                int outlier_count = 0;
+//                (void)outlier_count;
 
                 /* cyclic loop */
                 int i = 0;
                 // for (i = 1; i <= 10000; i++)
-                while (i < 3208000)
+                while (i < 10000)
                 {
                     i += 1;
 
@@ -175,10 +174,10 @@ void simpletest(char *ifname)
 /* ----------- 여기까지 --------------- */
 
                      /* ftrace trace_marker: 지연 발생 시 마커 기록 */
-                     if (period > SNAPSHOT_THRESHOLD_US && marker_fd >= 0) {
-                         dprintf(marker_fd, "OUTLIER cycle=%d period=%lu\n", i, period);
-                         outlier_count++;
-                     }
+//                     if (period > SNAPSHOT_THRESHOLD_US && marker_fd >= 0) {
+//                         dprintf(marker_fd, "OUTLIER cycle=%d period=%lu\n", i, period);
+//                         outlier_count++;
+//                     }
 
                      /* 1초마다 누적 히스토그램 출력 */
 //                     if ((t1 - last_print_ns) >= 1000000000)
@@ -225,9 +224,9 @@ void simpletest(char *ifname)
                 }
                 inOP = FALSE;
 
-                 if (marker_fd >= 0)
-                     close(marker_fd);
-                 printf("\nOutlier count (>%d us): %d\n", SNAPSHOT_THRESHOLD_US, outlier_count);
+//                 if (marker_fd >= 0)
+//                     close(marker_fd);
+////                 printf("\nOutlier count (>%d us): %d\n", SNAPSHOT_THRESHOLD_US, outlier_count);
 
                  puts("\n== Final Result ==");
                  for (int cnt = 1; cnt <= HIST_MAX + 1; cnt++)
