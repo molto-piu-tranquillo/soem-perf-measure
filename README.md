@@ -24,8 +24,8 @@ Disable irqbalance and pin the NIC IRQ to a dedicated CPU to reduce jitter.
 sudo systemctl stop irqbalance
 sudo systemctl disable irqbalance
 
-# Example: eth0 IRQ 131 -> CPU 3 (bitmask 8)
-sudo sh -c 'echo 8 > /proc/irq/131/smp_affinity'
+# Example: eth0 IRQ 131 -> CPU2 (bitmask 0x4)
+sudo sh -c 'echo 4 > /proc/irq/131/smp_affinity'
 ```
 
 PACKET_MMAP user-space polling
