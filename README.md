@@ -58,7 +58,11 @@ ps -eLo pid,psr,comm | awk '$2==2 || $2==3 {print $1}' | xargs -r -n1 taskset -p
 ```
 Boot-time (kernel cmdline):
 ```
-isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3
+sudo sed -i.bak 's/isolcpus=domain,managed,3 nohz_full=3 rcu_nocbs=3/isolcpus=domain,managed_irq,2,3 nohz_full=2,3 rcu_nocbs=2,3/' /etc/default/grub
+sudo update-grub
+sudo reboot
+
+grep isolcpus /etc/default/grub
 ```
 
 
