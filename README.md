@@ -33,6 +33,9 @@ grep -E "eth0|enp" /proc/interrupts
 sudo sh -c 'echo 4 > /proc/irq/131/smp_affinity'
 ```
 
+Note: isolcpus/AllowedCPUs only keep regular tasks off a CPU. They do not move
+IRQs. You still must pin NIC IRQs explicitly.
+
 To allow a small yield instead of full busy polling, set a non-zero sleep in
 nanoseconds (e.g. 1000 for ~1us):
 
