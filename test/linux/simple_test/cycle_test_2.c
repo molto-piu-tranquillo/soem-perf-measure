@@ -116,7 +116,7 @@ void simpletest(char *ifname)
                 /* cyclic loop */
                 int i = 0;
                 // for (i = 1; i <= 10000; i++)
-                while (i < 10000)
+                while (i < 50000000)
                 {
                     i += 1;
 

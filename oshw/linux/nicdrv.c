@@ -44,7 +44,12 @@
 #include <netpacket/packet.h>
 #include <pthread.h>
 
-// #include <linux/if_packet.h> // PACKET_QDISC_BYPASS 사용을 위해 필수
+#ifdef USE_AF_XDP
+#include <bpf/xsk.h>
+#include <linux/if_link.h>
+#include <sys/mman.h>
+#include <poll.h>
+#endif
 
 #include "oshw.h"
 #include "osal.h"
@@ -53,6 +58,56 @@
 #ifndef PACKET_QDISC_BYPASS
 #define PACKET_QDISC_BYPASS 20
 #endif
+
+#ifdef USE_AF_XDP
+/* AF_XDP configuration constants */
+#define XDP_NUM_FRAMES     512
+#define XDP_FRAME_SIZE     4096
+#define XDP_UMEM_SIZE      (XDP_NUM_FRAMES * XDP_FRAME_SIZE)  /* 2MB */
+#define XDP_RX_RING_SIZE   256  /* match NUM_RX_DESC in r8169 */
+#define XDP_TX_RING_SIZE   256  /* match NUM_TX_DESC in r8169 */
+#define XDP_RX_FRAMES      256
+#define XDP_TX_FRAME_START 256
+
+/* Global AF_XDP context — single NIC, no redundancy */
+static struct {
+   struct xsk_umem *umem;
+   struct xsk_socket *xsk;
+   struct xsk_ring_prod fq;   /* fill queue (producer) */
+   struct xsk_ring_prod tx;   /* TX queue (producer) */
+   struct xsk_ring_cons cq;   /* completion queue (consumer) */
+   struct xsk_ring_cons rx;   /* RX queue (consumer) */
+   void *umem_area;
+   int xsk_fd;
+   int ifindex;
+   __u32 tx_frame_idx;        /* round-robin TX frame index (32..63) */
+} xdp_ctx;
+
+/** Reclaim completed TX frames from completion queue */
+static void xdp_complete_tx(void)
+{
+   __u32 idx;
+   unsigned int completed;
+
+   completed = xsk_ring_cons__peek(&xdp_ctx.cq, XDP_TX_RING_SIZE, &idx);
+   if (completed > 0)
+      xsk_ring_cons__release(&xdp_ctx.cq, completed);
+}
+
+/** Populate fill queue with RX frames (addresses 0..31 * FRAME_SIZE) */
+static void xdp_fill_rx(void)
+{
+   __u32 idx;
+   unsigned int i;
+
+   if (xsk_ring_prod__reserve(&xdp_ctx.fq, XDP_RX_FRAMES, &idx) == XDP_RX_FRAMES)
+   {
+      for (i = 0; i < XDP_RX_FRAMES; i++)
+         *xsk_ring_prod__fill_addr(&xdp_ctx.fq, idx + i) = (__u64)i * XDP_FRAME_SIZE;
+      xsk_ring_prod__submit(&xdp_ctx.fq, XDP_RX_FRAMES);
+   }
+}
+#endif /* USE_AF_XDP */
 
 /** Redundancy modes */
 enum
@@ -96,10 +151,7 @@ static void ecx_clear_rxbufstat(int *rxbufstat)
 int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
 {
    int i;
-   int r, rval, ifindex;
-   struct timeval timeout;
-   struct ifreq ifr;
-   struct sockaddr_ll sll;
+   int rval;
    int *psock;
    pthread_mutexattr_t mutexattr;
 
@@ -148,62 +200,183 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
       ecx_clear_rxbufstat(&(port->rxbufstat[0]));
       psock = &(port->sockhandle);
    }
-   /* we use RAW packet socket, with packet type ETH_P_ECAT */
-   *psock = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ECAT));
 
-   // =========================================================================
-   // [추가된 코드 시작] 리얼타임 성능 최적화 (QDisc Bypass & Busy Poll)
-   // =========================================================================
-
-   // 1. QDisc Bypass: 송신 시 트래픽 제어 계층을 무시하고 드라이버로 직행 (Lock 제거)
-   int qdisc_bypass = 1;
-   if (setsockopt(*psock, SOL_PACKET, PACKET_QDISC_BYPASS, &qdisc_bypass, sizeof(qdisc_bypass)) < 0)
+#ifdef USE_AF_XDP
+   if (!secondary)
    {
-      // 에러 로그를 남기거나, 커널 버전이 낮아서 지원 안 할 경우 무시
-      // printf("Warning: PACKET_QDISC_BYPASS failed\n");
+      int r;
+      struct ifreq ifr;
+      struct xsk_umem_config umem_cfg;
+      struct xsk_socket_config xsk_cfg;
+      int tmp_sock;
+
+      /* get interface index */
+      xdp_ctx.ifindex = if_nametoindex(ifname);
+      if (!xdp_ctx.ifindex)
+      {
+         printf("AF_XDP: if_nametoindex failed for %s\n", ifname);
+         return 0;
+      }
+
+      /* set NIC to promiscuous mode via temporary socket */
+      tmp_sock = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ECAT));
+      if (tmp_sock >= 0)
+      {
+         strcpy(ifr.ifr_name, ifname);
+         ioctl(tmp_sock, SIOCGIFFLAGS, &ifr);
+         ifr.ifr_flags |= IFF_PROMISC | IFF_BROADCAST;
+         ioctl(tmp_sock, SIOCSIFFLAGS, &ifr);
+         close(tmp_sock);
+      }
+
+      /* allocate UMEM area — try hugepage first, fallback to normal mmap */
+      xdp_ctx.umem_area = mmap(NULL, XDP_UMEM_SIZE,
+                               PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
+                               -1, 0);
+      if (xdp_ctx.umem_area == MAP_FAILED)
+      {
+         xdp_ctx.umem_area = mmap(NULL, XDP_UMEM_SIZE,
+                                  PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS,
+                                  -1, 0);
+         if (xdp_ctx.umem_area == MAP_FAILED)
+         {
+            printf("AF_XDP: mmap UMEM failed\n");
+            return 0;
+         }
+      }
+
+      /* create UMEM */
+      umem_cfg.fill_size = XDP_RX_RING_SIZE;
+      umem_cfg.comp_size = XDP_TX_RING_SIZE;
+      umem_cfg.frame_size = XDP_FRAME_SIZE;
+      umem_cfg.frame_headroom = 0;
+      umem_cfg.flags = 0;
+
+      r = xsk_umem__create(&xdp_ctx.umem, xdp_ctx.umem_area, XDP_UMEM_SIZE,
+                           &xdp_ctx.fq, &xdp_ctx.cq, &umem_cfg);
+      if (r)
+      {
+         printf("AF_XDP: xsk_umem__create failed: %d\n", r);
+         munmap(xdp_ctx.umem_area, XDP_UMEM_SIZE);
+         return 0;
+      }
+
+      /* create XSK socket — zero-copy first, copy mode fallback */
+      xsk_cfg.rx_size = XDP_RX_RING_SIZE;
+      xsk_cfg.tx_size = XDP_TX_RING_SIZE;
+      xsk_cfg.libbpf_flags = 0;
+      xsk_cfg.xdp_flags = XDP_FLAGS_DRV_MODE;
+      xsk_cfg.bind_flags = XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP;
+
+      r = xsk_socket__create(&xdp_ctx.xsk, ifname, 0,
+                             xdp_ctx.umem, &xdp_ctx.rx, &xdp_ctx.tx, &xsk_cfg);
+      if (r)
+      {
+         printf("AF_XDP: zero-copy failed (%d), trying copy mode\n", r);
+         xsk_cfg.xdp_flags = XDP_FLAGS_SKB_MODE;
+         xsk_cfg.bind_flags = XDP_COPY | XDP_USE_NEED_WAKEUP;
+         r = xsk_socket__create(&xdp_ctx.xsk, ifname, 0,
+                                xdp_ctx.umem, &xdp_ctx.rx, &xdp_ctx.tx, &xsk_cfg);
+         if (r)
+         {
+            printf("AF_XDP: xsk_socket__create failed: %d\n", r);
+            xsk_umem__delete(xdp_ctx.umem);
+            munmap(xdp_ctx.umem_area, XDP_UMEM_SIZE);
+            return 0;
+         }
+      }
+
+      xdp_ctx.xsk_fd = xsk_socket__fd(xdp_ctx.xsk);
+      *psock = xdp_ctx.xsk_fd;
+      xdp_ctx.tx_frame_idx = XDP_TX_FRAME_START;
+
+      /* populate fill queue with RX frame addresses */
+      xdp_fill_rx();
+
+      rval = 1;
    }
-
-   // 2. Busy Poll: 소켓 수신 시 Sleep 하지 않고 커널에서 대기 (지터 제거 핵심)
-   // 50us 정도는 CPU를 양보하지 않고 뱅뱅 돌며 기다림. (EtherCAT 주기에 맞춰 조정 가능)
-//   int busy_poll_us = 50;
-//   if (setsockopt(*psock, SOL_SOCKET, SO_BUSY_POLL, &busy_poll_us, sizeof(busy_poll_us)) < 0)
-//   {
-//      // printf("Warning: SO_BUSY_POLL failed\n");
-//   }
-
-   // 3. Socket Priority: 소켓 우선순위를 최고(7)로 설정
-   int prio = 6; // TC_PRIO_INTERACTIVE or equivalent
-   if (setsockopt(*psock, SOL_SOCKET, SO_PRIORITY, &prio, sizeof(prio)) < 0)
+   else
    {
-      // printf("Warning: SO_PRIORITY failed\n");
+      /* secondary: use AF_PACKET (redundancy path, rarely used) */
+      int r, ifindex;
+      struct timeval timeout;
+      struct ifreq ifr;
+      struct sockaddr_ll sll;
+
+      *psock = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ECAT));
+      timeout.tv_sec = 0;
+      timeout.tv_usec = 1;
+      r = setsockopt(*psock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+      r = setsockopt(*psock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+      i = 1;
+      r = setsockopt(*psock, SOL_SOCKET, SO_DONTROUTE, &i, sizeof(i));
+      strcpy(ifr.ifr_name, ifname);
+      r = ioctl(*psock, SIOCGIFINDEX, &ifr);
+      ifindex = ifr.ifr_ifindex;
+      strcpy(ifr.ifr_name, ifname);
+      ifr.ifr_flags = 0;
+      r = ioctl(*psock, SIOCGIFFLAGS, &ifr);
+      ifr.ifr_flags = ifr.ifr_flags | IFF_PROMISC | IFF_BROADCAST;
+      r = ioctl(*psock, SIOCSIFFLAGS, &ifr);
+      sll.sll_family = AF_PACKET;
+      sll.sll_ifindex = ifindex;
+      sll.sll_protocol = htons(ETH_P_ECAT);
+      r = bind(*psock, (struct sockaddr *)&sll, sizeof(sll));
+      if (r == 0) rval = 1;
    }
+#else
+   {
+      /* AF_PACKET path (original) */
+      int r, ifindex;
+      struct timeval timeout;
+      struct ifreq ifr;
+      struct sockaddr_ll sll;
 
-   // =========================================================================
-   // [추가된 코드 끝]
-   // =========================================================================
+      /* we use RAW packet socket, with packet type ETH_P_ECAT */
+      *psock = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ECAT));
 
-   timeout.tv_sec = 0;
-   timeout.tv_usec = 1;
-   r = setsockopt(*psock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-   r = setsockopt(*psock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-   i = 1;
-   r = setsockopt(*psock, SOL_SOCKET, SO_DONTROUTE, &i, sizeof(i));
-   /* connect socket to NIC by name */
-   strcpy(ifr.ifr_name, ifname);
-   r = ioctl(*psock, SIOCGIFINDEX, &ifr);
-   ifindex = ifr.ifr_ifindex;
-   strcpy(ifr.ifr_name, ifname);
-   ifr.ifr_flags = 0;
-   /* reset flags of NIC interface */
-   r = ioctl(*psock, SIOCGIFFLAGS, &ifr);
-   /* set flags of NIC interface, here promiscuous and broadcast */
-   ifr.ifr_flags = ifr.ifr_flags | IFF_PROMISC | IFF_BROADCAST;
-   r = ioctl(*psock, SIOCSIFFLAGS, &ifr);
-   /* bind socket to protocol, in this case RAW EtherCAT */
-   sll.sll_family = AF_PACKET;
-   sll.sll_ifindex = ifindex;
-   sll.sll_protocol = htons(ETH_P_ECAT);
-   r = bind(*psock, (struct sockaddr *)&sll, sizeof(sll));
+      /* QDisc Bypass: skip traffic control layer on TX */
+      int qdisc_bypass = 1;
+      if (setsockopt(*psock, SOL_PACKET, PACKET_QDISC_BYPASS,
+                     &qdisc_bypass, sizeof(qdisc_bypass)) < 0)
+      {
+      }
+
+      /* Socket Priority */
+      int prio = 6;
+      if (setsockopt(*psock, SOL_SOCKET, SO_PRIORITY, &prio, sizeof(prio)) < 0)
+      {
+      }
+
+      timeout.tv_sec = 0;
+      timeout.tv_usec = 1;
+      r = setsockopt(*psock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+      r = setsockopt(*psock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+      i = 1;
+      r = setsockopt(*psock, SOL_SOCKET, SO_DONTROUTE, &i, sizeof(i));
+      /* connect socket to NIC by name */
+      strcpy(ifr.ifr_name, ifname);
+      r = ioctl(*psock, SIOCGIFINDEX, &ifr);
+      ifindex = ifr.ifr_ifindex;
+      strcpy(ifr.ifr_name, ifname);
+      ifr.ifr_flags = 0;
+      /* reset flags of NIC interface */
+      r = ioctl(*psock, SIOCGIFFLAGS, &ifr);
+      /* set flags of NIC interface, here promiscuous and broadcast */
+      ifr.ifr_flags = ifr.ifr_flags | IFF_PROMISC | IFF_BROADCAST;
+      r = ioctl(*psock, SIOCSIFFLAGS, &ifr);
+      /* bind socket to protocol, in this case RAW EtherCAT */
+      sll.sll_family = AF_PACKET;
+      sll.sll_ifindex = ifindex;
+      sll.sll_protocol = htons(ETH_P_ECAT);
+      r = bind(*psock, (struct sockaddr *)&sll, sizeof(sll));
+      if (r == 0)
+         rval = 1;
+   }
+#endif
+
    /* setup ethernet headers in tx buffers so we don't have to repeat it */
    for (i = 0; i < EC_MAXBUF; i++)
    {
@@ -211,8 +384,6 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
       port->rxbufstat[i] = EC_BUF_EMPTY;
    }
    ec_setupheader(&(port->txbuf2));
-   if (r == 0)
-      rval = 1;
 
    return rval;
 }
@@ -223,6 +394,24 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
  */
 int ecx_closenic(ecx_portt *port)
 {
+#ifdef USE_AF_XDP
+   if (xdp_ctx.xsk)
+   {
+      xsk_socket__delete(xdp_ctx.xsk);
+      xdp_ctx.xsk = NULL;
+      port->sockhandle = -1; /* fd closed by xsk_socket__delete */
+   }
+   if (xdp_ctx.umem)
+   {
+      xsk_umem__delete(xdp_ctx.umem);
+      xdp_ctx.umem = NULL;
+   }
+   if (xdp_ctx.umem_area)
+   {
+      munmap(xdp_ctx.umem_area, XDP_UMEM_SIZE);
+      xdp_ctx.umem_area = NULL;
+   }
+#endif
    if (port->sockhandle >= 0)
       close(port->sockhandle);
    if ((port->redport) && (port->redport->sockhandle >= 0))
@@ -320,11 +509,63 @@ int ecx_outframe(ecx_portt *port, int idx, int stacknumber)
    }
    lp = (*stack->txbuflength)[idx];
    (*stack->rxbufstat)[idx] = EC_BUF_TX;
+
+#ifdef USE_AF_XDP
+   if (!stacknumber)
+   {
+      __u32 tx_idx;
+      struct xdp_desc *desc;
+      void *frame_ptr;
+      __u64 frame_addr;
+
+      /* reclaim completed TX frames */
+      xdp_complete_tx();
+
+      /* get TX frame address (round-robin frames 32..63) */
+      frame_addr = (__u64)xdp_ctx.tx_frame_idx * XDP_FRAME_SIZE;
+      xdp_ctx.tx_frame_idx++;
+      if (xdp_ctx.tx_frame_idx >= XDP_NUM_FRAMES)
+         xdp_ctx.tx_frame_idx = XDP_TX_FRAME_START;
+
+      /* copy frame data to UMEM TX region */
+      frame_ptr = xsk_umem__get_data(xdp_ctx.umem_area, frame_addr);
+      memcpy(frame_ptr, (*stack->txbuf)[idx], lp);
+
+      /* reserve TX descriptor */
+      if (xsk_ring_prod__reserve(&xdp_ctx.tx, 1, &tx_idx) != 1)
+      {
+         (*stack->rxbufstat)[idx] = EC_BUF_EMPTY;
+         return -1;
+      }
+
+      desc = xsk_ring_prod__tx_desc(&xdp_ctx.tx, tx_idx);
+      desc->addr = frame_addr;
+      desc->len = lp;
+
+      xsk_ring_prod__submit(&xdp_ctx.tx, 1);
+
+      /* kick kernel to transmit */
+      if (xsk_ring_prod__needs_wakeup(&xdp_ctx.tx))
+         sendto(xdp_ctx.xsk_fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+
+      rval = lp;
+   }
+   else
+   {
+      /* secondary: AF_PACKET */
+      rval = send(*stack->sock, (*stack->txbuf)[idx], lp, 0);
+      if (rval == -1)
+      {
+         (*stack->rxbufstat)[idx] = EC_BUF_EMPTY;
+      }
+   }
+#else
    rval = send(*stack->sock, (*stack->txbuf)[idx], lp, 0);
    if (rval == -1)
    {
       (*stack->rxbufstat)[idx] = EC_BUF_EMPTY;
    }
+#endif
 
    return rval;
 }
@@ -387,18 +628,64 @@ static int ecx_recvpkt(ecx_portt *port, int stacknumber)
    }
    lp = sizeof(port->tempinbuf);
 
-   // static PerfMeasure my_timer;
-   // static int timer_inited = 0;
+#ifdef USE_AF_XDP
+   if (!stacknumber)
+   {
+      __u32 idx;
+      const struct xdp_desc *desc;
+      __u64 addr;
 
-   // if (!timer_inited)
-   // {
-   //    pm_init(&my_timer, "My Test Timer");
-   //    timer_inited = 1;
-   // }
+      /* non-blocking peek for available RX frames */
+      if (xsk_ring_cons__peek(&xdp_ctx.rx, 1, &idx) == 0)
+      {
+         /* no data — poll with 1ms timeout to yield CPU to ksoftirqd.
+          * CRITICAL: SOEM(FIFO 99) must sleep so ksoftirqd(FIFO 99)
+          * can run NAPI poll and deliver packets to XSK ring. */
+         struct pollfd pfd;
+         pfd.fd = xdp_ctx.xsk_fd;
+         pfd.events = POLLIN;
+         poll(&pfd, 1, 1);
 
-   // pm_start(&my_timer);
+         /* retry after poll */
+         if (xsk_ring_cons__peek(&xdp_ctx.rx, 1, &idx) == 0)
+         {
+            port->tempinbufs = 0;
+            return 0;
+         }
+      }
+
+      desc = xsk_ring_cons__rx_desc(&xdp_ctx.rx, idx);
+      bytesrx = desc->len;
+      addr = desc->addr;
+      if (bytesrx > lp)
+         bytesrx = lp;
+
+      /* copy from UMEM to tempinbuf */
+      memcpy((*stack->tempbuf),
+             xsk_umem__get_data(xdp_ctx.umem_area, addr),
+             bytesrx);
+
+      /* release RX descriptor */
+      xsk_ring_cons__release(&xdp_ctx.rx, 1);
+
+      /* return frame to fill queue for reuse */
+      {
+         __u32 fq_idx;
+         if (xsk_ring_prod__reserve(&xdp_ctx.fq, 1, &fq_idx) == 1)
+         {
+            *xsk_ring_prod__fill_addr(&xdp_ctx.fq, fq_idx) = addr;
+            xsk_ring_prod__submit(&xdp_ctx.fq, 1);
+         }
+      }
+   }
+   else
+   {
+      /* secondary: AF_PACKET */
+      bytesrx = recv(*stack->sock, (*stack->tempbuf), lp, 0);
+   }
+#else
    bytesrx = recv(*stack->sock, (*stack->tempbuf), lp, 0);
-   // pm_end(&my_timer);
+#endif
 
    port->tempinbufs = bytesrx;
 
@@ -535,15 +822,6 @@ static int ecx_waitinframe_red(ecx_portt *port, int idx, osal_timert *timer)
    int wkc2 = EC_NOFRAME;
    int primrx, secrx;
 
-//    static PerfMeasure my_timer;
-//    static int timer_inited = 0;
-//
-//    if (!timer_inited)
-//    {
-//       pm_init(&my_timer, "My Test Timer");
-//       timer_inited = 1;
-//    }
-
    /* if not in redundant mode then always assume secondary is OK */
    if (port->redstate == ECT_RED_NONE)
       wkc2 = 0;
@@ -552,9 +830,7 @@ static int ecx_waitinframe_red(ecx_portt *port, int idx, osal_timert *timer)
       /* only read frame if not already in */
       if (wkc <= EC_NOFRAME)
       {
-//                  pm_start(&my_timer); //시작
          wkc = ecx_inframe(port, idx, 0);
-//                  pm_end(&my_timer);   //종료
       }
       /* only try secondary if in redundant mode */
       if (port->redstate != ECT_RED_NONE)
@@ -631,22 +907,8 @@ int ecx_waitinframe(ecx_portt *port, int idx, int timeout)
    int wkc;
    osal_timert timer;
 
-   // static PerfMeasure my_timer;
-   // static int timer_inited = 0;
-
-   // if (!timer_inited)
-   // {
-   //    pm_init(&my_timer, "My Test Timer");
-   //    timer_inited = 1;
-   // }
-
-   // pm_start(&my_timer);
    osal_timer_start(&timer, timeout);
-   // pm_end(&my_timer); // 종료
-
-   // pm_start(&my_timer); // 시작
    wkc = ecx_waitinframe_red(port, idx, &timer);
-   // pm_end(&my_timer); // 종료
 
    return wkc;
 }
