@@ -93,8 +93,6 @@ static struct {
 
 static int xdp_warn_tx_reserve_cnt;
 static int xdp_warn_tx_kick_cnt;
-static int xdp_debug_tx_cnt;
-static int xdp_debug_rx_cnt;
 
 static void xdp_tx_free_init(void)
 {
@@ -475,15 +473,9 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
       xdp_ctx.xsk_fd = xsk_socket__fd(xdp_ctx.xsk);
       *psock = xdp_ctx.xsk_fd;
       xdp_tx_free_init();
-      xdp_debug_tx_cnt = 0;
-      xdp_debug_rx_cnt = 0;
 
       /* Driver may flap link during XSK setup/reset. Wait until carrier recovers. */
       xdp_wait_link_up(ifname);
-
-      printf("AF_XDP: DIAG xsk_fd=%d tx_free=%u fq_free=%u\n",
-             xdp_ctx.xsk_fd, xdp_ctx.tx_free_cnt,
-             xsk_prod_nb_free(&xdp_ctx.fq, XDP_RX_FRAMES));
 
       rval = 1;
    }
@@ -757,12 +749,6 @@ int ecx_outframe(ecx_portt *port, int idx, int stacknumber)
             xdp_warn_tx_kick_cnt++;
             printf("AF_XDP: TX kick(sendto) failed: %s\n", strerror(errno));
          }
-         if (xdp_debug_tx_cnt < 3)
-         {
-            printf("AF_XDP: TX[%d] len=%d kick=%d errno=%d\n",
-                   xdp_debug_tx_cnt, tx_len, kick_ret, (kick_ret < 0) ? errno : 0);
-            xdp_debug_tx_cnt++;
-         }
       }
 
       rval = lp;
@@ -872,21 +858,8 @@ static int ecx_recvpkt(ecx_portt *port, int stacknumber)
             struct pollfd pfd;
             pfd.fd = xdp_ctx.xsk_fd;
             pfd.events = POLLIN;
-            int poll_ret = poll(&pfd, 1, 1);
-            if (xdp_debug_rx_cnt < 5)
-            {
-               printf("AF_XDP: RX[%d] poll=%d revents=0x%x\n",
-                      xdp_debug_rx_cnt, poll_ret, pfd.revents);
-            }
+            poll(&pfd, 1, 1);
             continue;
-         }
-
-         if (xdp_debug_rx_cnt < 5)
-         {
-            const struct xdp_desc *dbg_desc = xsk_ring_cons__rx_desc(&xdp_ctx.rx, idx);
-            printf("AF_XDP: RX[%d] GOT pkt len=%u addr=0x%llx\n",
-                   xdp_debug_rx_cnt, dbg_desc->len,
-                   (unsigned long long)dbg_desc->addr);
          }
 
          desc = xsk_ring_cons__rx_desc(&xdp_ctx.rx, idx);
@@ -925,7 +898,6 @@ static int ecx_recvpkt(ecx_portt *port, int stacknumber)
             }
          }
 
-         xdp_debug_rx_cnt++;
          if (bytesrx > 0)
             break;
       }
