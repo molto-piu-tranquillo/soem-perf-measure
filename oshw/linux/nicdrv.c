@@ -39,8 +39,10 @@
 #include <time.h>
 #include <arpa/inet.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <fcntl.h>
 #include <string.h>
+#include <net/ethernet.h>
 #include <netpacket/packet.h>
 #include <pthread.h>
 
@@ -48,7 +50,9 @@
 #include <bpf/xsk.h>
 #include <linux/if_link.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <poll.h>
+#include <errno.h>
 #endif
 
 #include "oshw.h"
@@ -68,6 +72,7 @@
 #define XDP_TX_RING_SIZE   256  /* match NUM_TX_DESC in r8169 */
 #define XDP_RX_FRAMES      256
 #define XDP_TX_FRAME_START 256
+#define XDP_TX_FRAMES      (XDP_NUM_FRAMES - XDP_RX_FRAMES)
 
 /* Global AF_XDP context — single NIC, no redundancy */
 static struct {
@@ -80,18 +85,132 @@ static struct {
    void *umem_area;
    int xsk_fd;
    int ifindex;
-   __u32 tx_frame_idx;        /* round-robin TX frame index (32..63) */
+   __u64 tx_free_addrs[XDP_TX_FRAMES];
+   __u32 tx_free_head;
+   __u32 tx_free_tail;
+   __u32 tx_free_cnt;
 } xdp_ctx;
+
+static int xdp_warn_tx_reserve_cnt;
+static int xdp_warn_tx_kick_cnt;
+static int xdp_debug_tx_cnt;
+static int xdp_debug_rx_cnt;
+
+static void xdp_tx_free_init(void)
+{
+   __u32 i;
+
+   xdp_ctx.tx_free_head = 0;
+   xdp_ctx.tx_free_tail = 0;
+   xdp_ctx.tx_free_cnt = 0;
+
+   for (i = 0; i < XDP_TX_FRAMES; i++)
+   {
+      xdp_ctx.tx_free_addrs[xdp_ctx.tx_free_tail] =
+         (__u64)(XDP_TX_FRAME_START + i) * XDP_FRAME_SIZE;
+      xdp_ctx.tx_free_tail = (xdp_ctx.tx_free_tail + 1) % XDP_TX_FRAMES;
+      xdp_ctx.tx_free_cnt++;
+   }
+}
+
+static int xdp_tx_addr_pop(__u64 *addr)
+{
+   if (xdp_ctx.tx_free_cnt == 0)
+      return 0;
+
+   *addr = xdp_ctx.tx_free_addrs[xdp_ctx.tx_free_head];
+   xdp_ctx.tx_free_head = (xdp_ctx.tx_free_head + 1) % XDP_TX_FRAMES;
+   xdp_ctx.tx_free_cnt--;
+   return 1;
+}
+
+static void xdp_tx_addr_push(__u64 addr)
+{
+   if (xdp_ctx.tx_free_cnt >= XDP_TX_FRAMES)
+      return;
+
+   xdp_ctx.tx_free_addrs[xdp_ctx.tx_free_tail] = xsk_umem__extract_addr(addr);
+   xdp_ctx.tx_free_tail = (xdp_ctx.tx_free_tail + 1) % XDP_TX_FRAMES;
+   xdp_ctx.tx_free_cnt++;
+}
+
+static void xdp_release_ctx(void)
+{
+   if (xdp_ctx.xsk)
+   {
+      xsk_socket__delete(xdp_ctx.xsk);
+      xdp_ctx.xsk = NULL;
+   }
+   if (xdp_ctx.umem)
+   {
+      xsk_umem__delete(xdp_ctx.umem);
+      xdp_ctx.umem = NULL;
+   }
+   if (xdp_ctx.umem_area)
+   {
+      munmap(xdp_ctx.umem_area, XDP_UMEM_SIZE);
+      xdp_ctx.umem_area = NULL;
+   }
+   xdp_ctx.xsk_fd = -1;
+}
+
+static void xdp_detach_prog(int ifindex)
+{
+   int r;
+
+   if (!ifindex)
+      return;
+
+   /* libbpf helper tracks and detaches its own default XDP link/program. */
+   r = xsk_setup_xdp_prog(ifindex, NULL);
+   if (r && r != -ENOENT && r != -EOPNOTSUPP && r != -EINVAL)
+      printf("AF_XDP: warning: failed to detach XDP prog: %d (%s)\n",
+             r, strerror(-r));
+}
+
+static void xdp_wait_link_up(const char *ifname)
+{
+   int sock, i;
+   struct ifreq ifr;
+
+   sock = socket(AF_INET, SOCK_DGRAM, 0);
+   if (sock < 0)
+      return;
+
+   memset(&ifr, 0, sizeof(ifr));
+   strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+   ifr.ifr_name[IFNAMSIZ - 1] = '\0';
+
+   for (i = 0; i < 5000; i++) /* up to 5 s */
+   {
+      if (ioctl(sock, SIOCGIFFLAGS, &ifr) == 0 &&
+          (ifr.ifr_flags & IFF_RUNNING))
+         break;
+      usleep(1000);
+   }
+
+   if (i == 5000)
+      printf("AF_XDP: warning: link still not running after 5s on %s\n",
+             ifname);
+
+   close(sock);
+}
 
 /** Reclaim completed TX frames from completion queue */
 static void xdp_complete_tx(void)
 {
    __u32 idx;
    unsigned int completed;
+   unsigned int i;
 
    completed = xsk_ring_cons__peek(&xdp_ctx.cq, XDP_TX_RING_SIZE, &idx);
-   if (completed > 0)
-      xsk_ring_cons__release(&xdp_ctx.cq, completed);
+   if (completed == 0)
+      return;
+
+   for (i = 0; i < completed; i++)
+      xdp_tx_addr_push(*xsk_ring_cons__comp_addr(&xdp_ctx.cq, idx + i));
+
+   xsk_ring_cons__release(&xdp_ctx.cq, completed);
 }
 
 /** Populate fill queue with RX frames (addresses 0..31 * FRAME_SIZE) */
@@ -205,10 +324,13 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
    if (!secondary)
    {
       int r;
+      int xsks_map_fd = -1;
+      int force_copy_mode = 0;
       struct ifreq ifr;
       struct xsk_umem_config umem_cfg;
       struct xsk_socket_config xsk_cfg;
       int tmp_sock;
+      const char *env_force_copy;
 
       /* get interface index */
       xdp_ctx.ifindex = if_nametoindex(ifname);
@@ -217,6 +339,14 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
          printf("AF_XDP: if_nametoindex failed for %s\n", ifname);
          return 0;
       }
+      xdp_ctx.xsk_fd = -1;
+
+      /* Remove stale XDP program/map state left by previous crashes/runs. */
+      xdp_detach_prog(xdp_ctx.ifindex);
+
+      env_force_copy = getenv("SOEM_AF_XDP_FORCE_COPY");
+      if (env_force_copy && atoi(env_force_copy) != 0)
+         force_copy_mode = 1;
 
       /* set NIC to promiscuous mode via temporary socket */
       tmp_sock = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ECAT));
@@ -228,6 +358,12 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
          ioctl(tmp_sock, SIOCSIFFLAGS, &ifr);
          close(tmp_sock);
       }
+
+      /* AF_XDP requires locked memory for UMEM + rings */
+      struct rlimit rlim = { RLIM_INFINITY, RLIM_INFINITY };
+      if (setrlimit(RLIMIT_MEMLOCK, &rlim))
+         printf("AF_XDP: WARNING: setrlimit(MEMLOCK) failed: %s\n",
+                strerror(errno));
 
       /* allocate UMEM area — try hugepage first, fallback to normal mmap */
       xdp_ctx.umem_area = mmap(NULL, XDP_UMEM_SIZE,
@@ -260,40 +396,94 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
       {
          printf("AF_XDP: xsk_umem__create failed: %d\n", r);
          munmap(xdp_ctx.umem_area, XDP_UMEM_SIZE);
+         xdp_ctx.umem_area = NULL;
          return 0;
       }
 
-      /* create XSK socket — zero-copy first, copy mode fallback */
+      /* CRITICAL: populate fill queue BEFORE socket creation.
+       * xsk_socket__create() → bind → driver reopen → rtl8169_rx_fill()
+       * → xsk_buff_alloc() pulls from fill queue. If empty → ENOMEM. */
+      xdp_fill_rx();
+
+      /* create XSK socket — try zero-copy, then copy, both in DRV_MODE */
       xsk_cfg.rx_size = XDP_RX_RING_SIZE;
       xsk_cfg.tx_size = XDP_TX_RING_SIZE;
-      xsk_cfg.libbpf_flags = 0;
+      xsk_cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
       xsk_cfg.xdp_flags = XDP_FLAGS_DRV_MODE;
-      xsk_cfg.bind_flags = XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP;
+      xsk_cfg.bind_flags = force_copy_mode ?
+                           (XDP_COPY | XDP_USE_NEED_WAKEUP) :
+                           XDP_ZEROCOPY;
 
+      printf("AF_XDP: trying DRV_MODE + %s on %s (ifindex=%d)\n",
+             force_copy_mode ? "COPY (forced)" : "ZEROCOPY",
+             ifname, xdp_ctx.ifindex);
       r = xsk_socket__create(&xdp_ctx.xsk, ifname, 0,
                              xdp_ctx.umem, &xdp_ctx.rx, &xdp_ctx.tx, &xsk_cfg);
-      if (r)
+      if (r && !force_copy_mode)
       {
-         printf("AF_XDP: zero-copy failed (%d), trying copy mode\n", r);
-         xsk_cfg.xdp_flags = XDP_FLAGS_SKB_MODE;
+         printf("AF_XDP: DRV_MODE+ZEROCOPY failed: %d (%s)\n", r, strerror(-r));
+
+         printf("AF_XDP: trying DRV_MODE + COPY\n");
+         /* stay in DRV_MODE, just switch to COPY — avoids XDP mode conflict */
          xsk_cfg.bind_flags = XDP_COPY | XDP_USE_NEED_WAKEUP;
          r = xsk_socket__create(&xdp_ctx.xsk, ifname, 0,
                                 xdp_ctx.umem, &xdp_ctx.rx, &xdp_ctx.tx, &xsk_cfg);
          if (r)
          {
-            printf("AF_XDP: xsk_socket__create failed: %d\n", r);
-            xsk_umem__delete(xdp_ctx.umem);
-            munmap(xdp_ctx.umem_area, XDP_UMEM_SIZE);
+            printf("AF_XDP: DRV_MODE+COPY also failed: %d (%s)\n", r, strerror(-r));
+            xdp_release_ctx();
             return 0;
          }
+         printf("AF_XDP: DRV_MODE + COPY active (socket layer NOT bypassed)\n");
+      }
+      else if (!r)
+      {
+         if (force_copy_mode)
+            printf("AF_XDP: DRV_MODE + COPY active (forced)\n");
+         else
+            printf("AF_XDP: DRV_MODE + ZEROCOPY active (socket layer bypassed)\n");
+      }
+      else
+      {
+         printf("AF_XDP: DRV_MODE+COPY (forced) failed: %d (%s)\n",
+                r, strerror(-r));
+         xdp_release_ctx();
+         return 0;
+      }
+
+      /* Explicitly install default XDP redirect program and map this XSK. */
+      r = xsk_setup_xdp_prog(xdp_ctx.ifindex, &xsks_map_fd);
+      if (r)
+      {
+         printf("AF_XDP: xsk_setup_xdp_prog failed: %d (%s)\n", r, strerror(-r));
+         xdp_release_ctx();
+         xdp_detach_prog(xdp_ctx.ifindex);
+         return 0;
+      }
+
+      r = xsk_socket__update_xskmap(xdp_ctx.xsk, xsks_map_fd);
+      close(xsks_map_fd);
+      if (r)
+      {
+         printf("AF_XDP: xsk_socket__update_xskmap failed: %d (%s)\n",
+                r, strerror(-r));
+         xdp_release_ctx();
+         xdp_detach_prog(xdp_ctx.ifindex);
+         return 0;
       }
 
       xdp_ctx.xsk_fd = xsk_socket__fd(xdp_ctx.xsk);
       *psock = xdp_ctx.xsk_fd;
-      xdp_ctx.tx_frame_idx = XDP_TX_FRAME_START;
+      xdp_tx_free_init();
+      xdp_debug_tx_cnt = 0;
+      xdp_debug_rx_cnt = 0;
 
-      /* populate fill queue with RX frame addresses */
-      xdp_fill_rx();
+      /* Driver may flap link during XSK setup/reset. Wait until carrier recovers. */
+      xdp_wait_link_up(ifname);
+
+      printf("AF_XDP: DIAG xsk_fd=%d tx_free=%u fq_free=%u\n",
+             xdp_ctx.xsk_fd, xdp_ctx.tx_free_cnt,
+             xsk_prod_nb_free(&xdp_ctx.fq, XDP_RX_FRAMES));
 
       rval = 1;
    }
@@ -395,22 +585,10 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
 int ecx_closenic(ecx_portt *port)
 {
 #ifdef USE_AF_XDP
-   if (xdp_ctx.xsk)
-   {
-      xsk_socket__delete(xdp_ctx.xsk);
-      xdp_ctx.xsk = NULL;
-      port->sockhandle = -1; /* fd closed by xsk_socket__delete */
-   }
-   if (xdp_ctx.umem)
-   {
-      xsk_umem__delete(xdp_ctx.umem);
-      xdp_ctx.umem = NULL;
-   }
-   if (xdp_ctx.umem_area)
-   {
-      munmap(xdp_ctx.umem_area, XDP_UMEM_SIZE);
-      xdp_ctx.umem_area = NULL;
-   }
+   xdp_release_ctx();
+   xdp_detach_prog(xdp_ctx.ifindex);
+   xdp_ctx.ifindex = 0;
+   port->sockhandle = -1; /* fd closed by xsk_socket__delete */
 #endif
    if (port->sockhandle >= 0)
       close(port->sockhandle);
@@ -517,36 +695,75 @@ int ecx_outframe(ecx_portt *port, int idx, int stacknumber)
       struct xdp_desc *desc;
       void *frame_ptr;
       __u64 frame_addr;
+      int tx_len = lp;
 
       /* reclaim completed TX frames */
       xdp_complete_tx();
 
-      /* get TX frame address (round-robin frames 32..63) */
-      frame_addr = (__u64)xdp_ctx.tx_frame_idx * XDP_FRAME_SIZE;
-      xdp_ctx.tx_frame_idx++;
-      if (xdp_ctx.tx_frame_idx >= XDP_NUM_FRAMES)
-         xdp_ctx.tx_frame_idx = XDP_TX_FRAME_START;
+      /* get one completed/free TX frame address */
+      if (!xdp_tx_addr_pop(&frame_addr))
+      {
+         /* kick and retry once */
+         if (sendto(xdp_ctx.xsk_fd, NULL, 0, MSG_DONTWAIT, NULL, 0) < 0 &&
+             xdp_warn_tx_kick_cnt < 8)
+         {
+            xdp_warn_tx_kick_cnt++;
+            printf("AF_XDP: TX kick(sendto) failed: %s\n", strerror(errno));
+         }
+         xdp_complete_tx();
+         if (!xdp_tx_addr_pop(&frame_addr))
+         {
+            (*stack->rxbufstat)[idx] = EC_BUF_EMPTY;
+            return -1;
+         }
+      }
 
       /* copy frame data to UMEM TX region */
       frame_ptr = xsk_umem__get_data(xdp_ctx.umem_area, frame_addr);
       memcpy(frame_ptr, (*stack->txbuf)[idx], lp);
 
+      /* AF_XDP bypasses skb helpers, so enforce minimum Ethernet frame size. */
+      if (tx_len < ETH_ZLEN)
+      {
+         memset((uint8 *)frame_ptr + tx_len, 0, ETH_ZLEN - tx_len);
+         tx_len = ETH_ZLEN;
+      }
+
       /* reserve TX descriptor */
       if (xsk_ring_prod__reserve(&xdp_ctx.tx, 1, &tx_idx) != 1)
       {
+         if (xdp_warn_tx_reserve_cnt < 8)
+         {
+            xdp_warn_tx_reserve_cnt++;
+            printf("AF_XDP: TX ring reserve failed\n");
+         }
          (*stack->rxbufstat)[idx] = EC_BUF_EMPTY;
          return -1;
       }
 
       desc = xsk_ring_prod__tx_desc(&xdp_ctx.tx, tx_idx);
       desc->addr = frame_addr;
-      desc->len = lp;
+      desc->len = tx_len;
 
       xsk_ring_prod__submit(&xdp_ctx.tx, 1);
 
-      /* kick kernel to transmit */
-      if (xsk_ring_prod__needs_wakeup(&xdp_ctx.tx))
-         sendto(xdp_ctx.xsk_fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+      /* Always kick kernel — NEED_WAKEUP flag is only set after first
+       * NAPI poll, so the very first TX would never be processed without
+       * an unconditional sendto(). */
+      {
+         int kick_ret = sendto(xdp_ctx.xsk_fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+         if (kick_ret < 0 && xdp_warn_tx_kick_cnt < 8)
+         {
+            xdp_warn_tx_kick_cnt++;
+            printf("AF_XDP: TX kick(sendto) failed: %s\n", strerror(errno));
+         }
+         if (xdp_debug_tx_cnt < 3)
+         {
+            printf("AF_XDP: TX[%d] len=%d kick=%d errno=%d\n",
+                   xdp_debug_tx_cnt, tx_len, kick_ret, (kick_ret < 0) ? errno : 0);
+            xdp_debug_tx_cnt++;
+         }
+      }
 
       rval = lp;
    }
@@ -634,48 +851,83 @@ static int ecx_recvpkt(ecx_portt *port, int stacknumber)
       __u32 idx;
       const struct xdp_desc *desc;
       __u64 addr;
+      int poll_tries = 0;
+      int scan_budget = 64;
+      bytesrx = 0;
 
-      /* non-blocking peek for available RX frames */
-      if (xsk_ring_cons__peek(&xdp_ctx.rx, 1, &idx) == 0)
+      /* Drain up to scan_budget packets and return the first EtherCAT frame. */
+      while (scan_budget-- > 0)
       {
-         /* no data — poll with 1ms timeout to yield CPU to ksoftirqd.
-          * CRITICAL: SOEM(FIFO 99) must sleep so ksoftirqd(FIFO 99)
-          * can run NAPI poll and deliver packets to XSK ring. */
-         struct pollfd pfd;
-         pfd.fd = xdp_ctx.xsk_fd;
-         pfd.events = POLLIN;
-         poll(&pfd, 1, 1);
+         void *pkt;
+         __u16 etype = 0;
 
-         /* retry after poll */
          if (xsk_ring_cons__peek(&xdp_ctx.rx, 1, &idx) == 0)
          {
-            port->tempinbufs = 0;
-            return 0;
+            if (poll_tries++ > 0)
+               break;
+
+            /* no data — poll with 1ms timeout to yield CPU to ksoftirqd.
+             * CRITICAL: SOEM(FIFO 99) must sleep so ksoftirqd(FIFO 99)
+             * can run NAPI poll and deliver packets to XSK ring. */
+            struct pollfd pfd;
+            pfd.fd = xdp_ctx.xsk_fd;
+            pfd.events = POLLIN;
+            int poll_ret = poll(&pfd, 1, 1);
+            if (xdp_debug_rx_cnt < 5)
+            {
+               printf("AF_XDP: RX[%d] poll=%d revents=0x%x\n",
+                      xdp_debug_rx_cnt, poll_ret, pfd.revents);
+            }
+            continue;
          }
-      }
 
-      desc = xsk_ring_cons__rx_desc(&xdp_ctx.rx, idx);
-      bytesrx = desc->len;
-      addr = desc->addr;
-      if (bytesrx > lp)
-         bytesrx = lp;
-
-      /* copy from UMEM to tempinbuf */
-      memcpy((*stack->tempbuf),
-             xsk_umem__get_data(xdp_ctx.umem_area, addr),
-             bytesrx);
-
-      /* release RX descriptor */
-      xsk_ring_cons__release(&xdp_ctx.rx, 1);
-
-      /* return frame to fill queue for reuse */
-      {
-         __u32 fq_idx;
-         if (xsk_ring_prod__reserve(&xdp_ctx.fq, 1, &fq_idx) == 1)
+         if (xdp_debug_rx_cnt < 5)
          {
-            *xsk_ring_prod__fill_addr(&xdp_ctx.fq, fq_idx) = addr;
-            xsk_ring_prod__submit(&xdp_ctx.fq, 1);
+            const struct xdp_desc *dbg_desc = xsk_ring_cons__rx_desc(&xdp_ctx.rx, idx);
+            printf("AF_XDP: RX[%d] GOT pkt len=%u addr=0x%llx\n",
+                   xdp_debug_rx_cnt, dbg_desc->len,
+                   (unsigned long long)dbg_desc->addr);
          }
+
+         desc = xsk_ring_cons__rx_desc(&xdp_ctx.rx, idx);
+         addr = desc->addr;
+         pkt = xsk_umem__get_data(xdp_ctx.umem_area, addr);
+
+         if (desc->len >= ETH_HEADERSIZE)
+         {
+            ec_etherheadert *eh = (ec_etherheadert *)pkt;
+            etype = ntohs(eh->etype);
+         }
+
+         if (etype == ETH_P_ECAT)
+         {
+            bytesrx = desc->len;
+            if (bytesrx > lp)
+               bytesrx = lp;
+            memcpy((*stack->tempbuf), pkt, bytesrx);
+         }
+
+         /* release RX descriptor */
+         xsk_ring_cons__release(&xdp_ctx.rx, 1);
+
+         /* return frame to fill queue for reuse */
+         {
+            __u32 fq_idx;
+            if (xsk_ring_prod__reserve(&xdp_ctx.fq, 1, &fq_idx) == 1)
+            {
+               *xsk_ring_prod__fill_addr(&xdp_ctx.fq, fq_idx) =
+                  xsk_umem__extract_addr(addr);
+               xsk_ring_prod__submit(&xdp_ctx.fq, 1);
+
+               /* In NEED_WAKEUP mode, RX refill may require an explicit kick. */
+               if (xsk_ring_prod__needs_wakeup(&xdp_ctx.fq))
+                  sendto(xdp_ctx.xsk_fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+            }
+         }
+
+         xdp_debug_rx_cnt++;
+         if (bytesrx > 0)
+            break;
       }
    }
    else
