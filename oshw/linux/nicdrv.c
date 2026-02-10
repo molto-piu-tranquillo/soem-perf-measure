@@ -849,11 +849,15 @@ static int ecx_recvpkt(ecx_portt *port, int stacknumber)
 
       /* IgH-like polling model — no IRQ/ksoftirqd dependency.
        *
-       * On each peek miss, re-kick NAPI via sendto() then run
-       * napi_busy_loop() inline via poll(0).  This forces one
-       * NAPI poll cycle (rtl_rx_zc checks HW RX descriptors
-       * directly) regardless of whether an IRQ has fired.
-       * Everything runs synchronously in SOEM's thread on CPU3. */
+       * On each peek miss, sendto() primes NAPI via xsk_wakeup →
+       * napi_schedule (sets SCHED + raises softirq).  Then poll(0)
+       * enters napi_busy_loop → local_bh_enable processes the
+       * pending softirq inline, executing napi->poll() in SOEM's
+       * process context on CPU3.
+       *
+       * sendto() MUST precede poll(): inside sock_poll(),
+       * busy_loop runs BEFORE xsk_poll, so xsk_wakeup called
+       * by poll() only primes the NEXT call — too late. */
       while (scan_budget-- > 0)
       {
          void *pkt;
@@ -861,14 +865,10 @@ static int ecx_recvpkt(ecx_portt *port, int stacknumber)
 
          if (xsk_ring_cons__peek(&xdp_ctx.rx, 1, &idx) == 0)
          {
-            /* Re-schedule NAPI (sets NAPI_STATE_SCHED) so that
-             * the following busy-poll can run one NAPI cycle.
-             * sendto() on XSK always calls ndo_xsk_wakeup →
-             * napi_schedule, even with an empty TX ring. */
+            /* Prime NAPI: sendto() → xsk_wakeup → napi_schedule
+             * then poll(0) busy-loop processes it inline. */
             sendto(xdp_ctx.xsk_fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
-            struct pollfd pfd;
-            pfd.fd = xdp_ctx.xsk_fd;
-            pfd.events = POLLIN;
+            struct pollfd pfd = { .fd = xdp_ctx.xsk_fd, .events = POLLIN };
             poll(&pfd, 1, 0);
             continue;
          }
