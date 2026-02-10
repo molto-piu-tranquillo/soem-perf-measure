@@ -477,18 +477,16 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
       /* Enable busy polling — NAPI poll runs inline in our thread context
        * (IgH-like model: no IRQ/ksoftirqd dependency for TX/RX). */
       {
-         int opt_val, r1, r2, r3;
+         int opt_val;
          opt_val = 1;
-         r1 = setsockopt(xdp_ctx.xsk_fd, SOL_SOCKET, SO_PREFER_BUSY_POLL,
-                         &opt_val, sizeof(opt_val));
+         setsockopt(xdp_ctx.xsk_fd, SOL_SOCKET, SO_PREFER_BUSY_POLL,
+                    &opt_val, sizeof(opt_val));
          opt_val = 64;  /* busy-poll timeout in μs */
-         r2 = setsockopt(xdp_ctx.xsk_fd, SOL_SOCKET, SO_BUSY_POLL,
-                         &opt_val, sizeof(opt_val));
+         setsockopt(xdp_ctx.xsk_fd, SOL_SOCKET, SO_BUSY_POLL,
+                    &opt_val, sizeof(opt_val));
          opt_val = 8;   /* NAPI budget per busy-poll cycle */
-         r3 = setsockopt(xdp_ctx.xsk_fd, SOL_SOCKET, SO_BUSY_POLL_BUDGET,
-                         &opt_val, sizeof(opt_val));
-         printf("AF_XDP: busy-poll setsockopt: PREFER=%d POLL=%d BUDGET=%d\n",
-                r1, r2, r3);
+         setsockopt(xdp_ctx.xsk_fd, SOL_SOCKET, SO_BUSY_POLL_BUDGET,
+                    &opt_val, sizeof(opt_val));
       }
 
       /* Driver may flap link during XSK setup/reset. Wait until carrier recovers. */
@@ -756,17 +754,9 @@ int ecx_outframe(ecx_portt *port, int idx, int stacknumber)
 
       xsk_ring_prod__submit(&xdp_ctx.tx, 1);
 
-      /* Always kick kernel — NEED_WAKEUP flag is only set after first
-       * NAPI poll, so the very first TX would never be processed without
-       * an unconditional sendto(). */
-      {
-         int kick_ret = sendto(xdp_ctx.xsk_fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
-         if (kick_ret < 0 && xdp_warn_tx_kick_cnt < 8)
-         {
-            xdp_warn_tx_kick_cnt++;
-            printf("AF_XDP: TX kick(sendto) failed: %s\n", strerror(errno));
-         }
-      }
+      /* No sendto() kick here — the busy-poll loop in ecx_recvpkt()
+       * re-schedules NAPI via sendto() + poll(0), which processes
+       * pending TX via rtl8169_xsk_tx().  One less syscall per cycle. */
 
       rval = lp;
    }
