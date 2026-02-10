@@ -837,30 +837,21 @@ static int ecx_recvpkt(ecx_portt *port, int stacknumber)
       __u32 idx;
       const struct xdp_desc *desc;
       __u64 addr;
-      int poll_tries = 0;
       int scan_budget = 64;
       bytesrx = 0;
 
-      /* Drain up to scan_budget packets and return the first EtherCAT frame. */
+      /* Drain up to scan_budget packets and return the first EtherCAT frame.
+       * No poll() here — return immediately if ring is empty, just like
+       * AF_PACKET's recv() with 1μs SO_RCVTIMEO.  The outer loop in
+       * ecx_waitinframe_red() handles retries.  SOEM runs on isolated
+       * CPU3 while ksoftirqd/NAPI runs on CPU0, so no yield needed. */
       while (scan_budget-- > 0)
       {
          void *pkt;
          __u16 etype = 0;
 
          if (xsk_ring_cons__peek(&xdp_ctx.rx, 1, &idx) == 0)
-         {
-            if (poll_tries++ > 0)
-               break;
-
-            /* no data — poll with 1ms timeout to yield CPU to ksoftirqd.
-             * CRITICAL: SOEM(FIFO 99) must sleep so ksoftirqd(FIFO 99)
-             * can run NAPI poll and deliver packets to XSK ring. */
-            struct pollfd pfd;
-            pfd.fd = xdp_ctx.xsk_fd;
-            pfd.events = POLLIN;
-            poll(&pfd, 1, 1);
-            continue;
-         }
+            break;
 
          desc = xsk_ring_cons__rx_desc(&xdp_ctx.rx, idx);
          addr = desc->addr;
