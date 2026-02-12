@@ -67,8 +67,10 @@ static int resolve_pci_bdf(const char *ifname, char *bdf, size_t bdflen)
    ssize_t len = readlink(path, link, sizeof(link) - 1);
    if (len < 0)
    {
-      fprintf(stderr, "Cannot resolve %s to PCI BDF\n", ifname);
-      return -1;
+      /* Interface gone (already bound to UIO). Fall back to default BDF. */
+      printf("UIO: %s not found, using default %s\n", ifname, RTL8168_PCI_BDF);
+      snprintf(bdf, bdflen, "%s", RTL8168_PCI_BDF);
+      return 0;
    }
    link[len] = '\0';
    /* link is something like "../../devices/pci0000:00/.../0000:01:00.0" */
