@@ -10,7 +10,6 @@ endif()
 set(SOEM_INCLUDE_INSTALL_DIR include/soem)
 set(SOEM_LIB_INSTALL_DIR lib)
 set(BUILD_TESTS TRUE)
-set(SOEM_PATH "/home/test/EtherCAT/SOEM")
 
 if(WIN32)
   set(OS "win32")
@@ -28,11 +27,6 @@ elseif(UNIX AND NOT APPLE)
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Werror")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-stringop-truncation")
   set(OS_LIBS pthread rt)
-  set(R8169_UIO_DIR "$ENV{HOME}/kernel_patch/linux-6.8/drivers/net/ethernet/realtek/r8169_uio")
-  add_definitions(-DUSE_UIO)
-  include_directories(${R8169_UIO_DIR}/include)
-  link_directories(${R8169_UIO_DIR}/build)
-  list(APPEND OS_LIBS r8169_uio)
 elseif(APPLE)
   # This must come *before* linux or MacOSX will identify as Unix.
   set(OS "macosx")
@@ -71,13 +65,6 @@ include_directories(soem)
 include_directories(osal)
 include_directories(osal/${OS})
 include_directories(oshw/${OS})
-
-include_directories(
-  ${SOEM_PATH}/soem
-  ${SOEM_PATH}/osal
-  ${SOEM_PATH}/osal/linux
-  ${SOEM_PATH}/oshw/linux
-)
 
 add_library(soem STATIC
   ${SOEM_SOURCES}
