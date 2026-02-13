@@ -1,74 +1,53 @@
-# Simple Open EtherCAT Master Library
-[![Build Status](https://travis-ci.org/OpenEtherCATsociety/SOEM.svg?branch=master)](https://travis-ci.org/OpenEtherCATsociety/SOEM)
-[![Build status](https://ci.appveyor.com/api/projects/status/bqgirjsxog9k1odf?svg=true)](https://ci.appveyor.com/project/hefloryd/soem-5kq8b)
+# SOEM — EtherCAT Latency Optimization Fork
 
-This fork focuses on measuring and improving EtherCAT latency/jitter in SOEM.
-It adds performance instrumentation and test harnesses for cycle timing analysis.
+Fork of [SOEM](https://github.com/OpenEtherCATsociety/SOEM) focused on
+send-recv latency/jitter reduction for real-time EtherCAT on Linux RT.
 
-PERFORMANCE NOTES
-=================
+## Branches
 
-Clock mode (relative vs absolute)
----------------------------------
+| Branch | Transport | Description |
+|--------|-----------|-------------|
+| `main` | AF_PACKET | Stock SOEM + perf instrumentation |
+| `feat/af-xdp` | AF_XDP | Zero-copy busy-poll, IRQ-free NAPI |
+| `feat/uio` | **UIO (DPDK-style)** | Kernel bypass, zero-syscall TX/RX |
 
-Some tests use `clock_nanosleep()` with `CLOCK_MONOTONIC`. You can choose
-relative sleep or absolute (TIMER_ABSTIME) scheduling by toggling the
-commented code paths in the test file.
+## Build
 
-IRQ affinity (real-time responsiveness)
----------------------------------------
-
-Disable irqbalance and pin the NIC IRQ to a dedicated CPU to reduce jitter.
-
-```
-sudo systemctl stop irqbalance
-sudo systemctl disable irqbalance
-
-# Example: eth0 IRQ 131 -> CPU 3 (bitmask 8)
-sudo sh -c 'echo 8 > /proc/irq/131/smp_affinity'
+```bash
+mkdir build && cd build
+cmake ..
+make
 ```
 
-BUILDING
-========
+feat/uio 브랜치는 r8169_uio 드라이버 소스를 `oshw/linux/`에 직접 포함하고 있어
+외부 의존성 없이 빌드 가능.
 
+## Usage
 
-Prerequisites for all platforms
--------------------------------
+### feat/uio (UIO transport)
 
- * CMake 2.8.0 or later
+```bash
+# 1. Bind NIC to UIO
+sudo /path/to/r8169_uio/scripts/bind_uio.sh bind
 
+# 2. Run
+sudo ./build/test/linux/simple_test/cycle_test_2 eth0
+# or
+sudo ./build/test/linux/simple_test/cycle_test_2 0000:01:00.0
 
-Windows (Visual Studio)
------------------------
+# 3. Restore kernel driver
+sudo /path/to/r8169_uio/scripts/bind_uio.sh unbind
+```
 
- * Start a Visual Studio command prompt then:
-   * `mkdir build`
-   * `cd build`
-   * `cmake .. -G "NMake Makefiles"`
-   * `nmake`
+### main / feat/af-xdp
 
-Linux & macOS
---------------
+```bash
+sudo ./build/test/linux/simple_test/cycle_test_2 eth0
+```
 
-   * `mkdir build`
-   * `cd build`
-   * `cmake ..`
-   * `make`
+## System Setup
 
-ERIKA Enterprise RTOS
----------------------
-
- * Refer to http://www.erika-enterprise.com/wiki/index.php?title=EtherCAT_Master
-
-Documentation
--------------
-
-See https://openethercatsociety.github.io/doc/soem/
-
-
-Want to contribute to SOEM or SOES?
------------------------------------
-
-If you want to contribute to SOEM or SOES you will need to sign a Contributor
-License Agreement and send it to us either by e-mail or by physical mail. More
-information is available in the [PDF](http://openethercatsociety.github.io/cla/cla_soem_soes.pdf).
+- CPU isolation: `isolcpus=3 nohz_full=3 rcu_nocbs=3`
+- RT scheduling: `chrt -f 99 taskset -c 3 ./cycle_test_2 eth0`
+- CAT L2 (optional): `resctrl` 로 CPU3에 L2 way 할당
+- IRQ affinity: `irqbalance` 비활성화
