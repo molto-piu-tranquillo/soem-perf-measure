@@ -116,7 +116,7 @@ void simpletest(char *ifname)
                 /* cyclic loop */
                 int i = 0;
                 // for (i = 1; i <= 10000; i++)
-                while (i < 10000)
+                while (i < 1000000)
                 {
                     i += 1;
 
@@ -129,11 +129,11 @@ void simpletest(char *ifname)
                         target_ts.tv_nsec -= 1000000000;
                     }
                     //* 해당 target_ts까지 대기
-//                    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &target_ts, NULL);
+                    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &target_ts, NULL);
 
                     /* 상대 시간 1ms sleep - bpftrace 측정용 */
-                    struct timespec sleep_rel = {0, 1000000};
-                    clock_nanosleep(CLOCK_MONOTONIC, 0, &sleep_rel, NULL);
+//                    struct timespec sleep_rel = {0, 1000000};
+//                    clock_nanosleep(CLOCK_MONOTONIC, 0, &sleep_rel, NULL);
 
                     uint64_t t0 = now_ns();
                     *(uint16 *)ec_slave[1].outputs = 0xF0F0; // 디버깅 용. slave 디스플레이에 뜬다
